@@ -2,17 +2,10 @@
 scanner/instrument.py
 ---------------------
 Per-instrument scan orchestration.
-
-InstrumentScanner handles:
-  - contract discovery (delegated to data.ib_client)
-  - per-scan cycle: quotes -> liquidity -> moneyness filter -> IV/Greeks
-    -> signal evaluation -> fingerprint update/detect -> alerts -> logging
-  - console output structured for readability (and future UI consumption)
-  - optional tick stream management (Option A)
 """
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import pandas as pd
@@ -30,7 +23,10 @@ from options_scanner.data import (
     safe_mid,
     TickStream,
 )
-from options_scanner.data.ib_client import EquityStream, OIStream, qualify_chain_for_scan
+from options_scanner.data.ib_client import (
+    EquityStream, OIStream, FuturesTickStream, FuturesMomentum,
+    qualify_chain_for_scan,
+)
 from options_scanner.models import compute as model_compute
 from options_scanner.signals.volume_history import VolumeHistory
 from options_scanner.signals import evaluate as signal_evaluate
@@ -67,31 +63,20 @@ class InstrumentScanner:
         self.csv_logger    = csv_logger
         self.cache_manager = cache_manager
 
-        # Populated from CacheManager (or fallback inline discovery)
         self.underlying_contracts : list = []
         self.option_contracts     : list = []
-        self.details_cache        : dict = {}   # conId -> ContractDetails
+        self.details_cache        : dict = {}
         self._discovered          : bool = False
 
-        # Option A: tick streams keyed by conId
-        self._tick_streams  : dict[int, TickStream]       = {}
-        # Persistent equity stream for OPT instruments (resolves undPrice)
-        self._equity_stream : 'EquityStream | None'       = None
-        # Persistent OI streams for FOP underlying futures (one per future conId).
-        # Keeps genericTickList='101' (open interest) alive so IB populates
-        # openInterest on subsequent option snapshot rows.
-        self._oi_streams    : dict[int, 'OIStream']       = {}
-        # ChainSpec list from cache (v0.3.0+)
-        self._chain_specs   : list                        = []
+        self._tick_streams         : dict[int, TickStream]         = {}
+        self._equity_stream        : 'EquityStream | None'         = None
+        self._oi_streams           : dict[int, OIStream]           = {}
+        self._futures_tick_streams : dict[int, FuturesTickStream]  = {}
+        self._chain_specs          : list                          = []
 
     # ── Discovery ─────────────────────────────────────────────────────────────
 
     async def discover(self) -> None:
-        """
-        Load contracts from CacheManager if available, otherwise fall back to
-        inline IB discovery.  CacheManager is the preferred path — it is
-        non-blocking and returns cached data immediately.
-        """
         if self.cache_manager and self.cache_manager.is_ready(self.key):
             self._load_from_cache()
         else:
@@ -108,15 +93,10 @@ class InstrumentScanner:
             f"{len(self.option_contracts)} options."
         )
 
-        # Start persistent equity stream for OPT instruments so that
-        # the underlying price is always available for IV/Greeks computation
         if self.cfg['secType'] == 'OPT':
             self._equity_stream = EquityStream(self.ib, self.cfg)
             await self._equity_stream.start()
 
-        # Start persistent OI streams for FOP underlying futures so that
-        # IB populates openInterest on option snapshot rows (generic tick 101
-        # requires a non-snapshot stream; snapshot=True is incompatible).
         if self.cfg['secType'] == 'FOP':
             await self._start_oi_streams()
 
@@ -124,11 +104,8 @@ class InstrumentScanner:
             self._start_tick_streams()
 
     def _load_from_cache(self) -> None:
-        """Pull ChainSpecs and futures from CacheManager into scanner state."""
-        # v0.3.0+: cache stores ChainSpec params; contracts qualified per-scan
         self._chain_specs         = self.cache_manager.serve_chain_specs(self.key)
         self.underlying_contracts = self.cache_manager.serve_underlying(self.key)
-        # Clear pre-qualified option_contracts — they are built fresh each scan
         self.option_contracts     = []
         self.details_cache        = {}
         total = sum(len(s.expirations) * len(s.strikes) * 2
@@ -138,44 +115,39 @@ class InstrumentScanner:
               f"({total} theoretical contracts), "
               f"{len(self.underlying_contracts)} underlying futures")
 
-    # ── OI streams (FOP only) ─────────────────────────────────────────────────
+    # ── OI + momentum streams (FOP only) ─────────────────────────────────────
 
     async def _start_oi_streams(self) -> None:
-        """
-        Open a persistent non-snapshot stream per underlying future contract
-        with genericTickList='588' (Futures Open Interest, tick ID 86).
-
-        IB does not populate openInterest on snapshot=True requests.
-        Keeping a non-snapshot stream alive causes IB to populate
-        futuresOpenInterest and, over time, openInterest on subsequent option
-        snapshot rows during the same session.
-
-        One stream per underlying future is sufficient for the macro OI picture.
-        """
         for fut in self.underlying_contracts:
-            stream = OIStream(self.ib, fut)
-            await stream.start()
-            self._oi_streams[fut.conId] = stream
+            oi_stream = OIStream(self.ib, fut)
+            await oi_stream.start()
+            self._oi_streams[fut.conId] = oi_stream
+
+            ft_stream = FuturesTickStream(self.ib, fut)
+            if oi_stream._ticker is not None:
+                ft_stream.set_oi_ticker(oi_stream._ticker)
+            ft_stream.start()
+            self._futures_tick_streams[fut.conId] = ft_stream
+
         if self._oi_streams:
-            print(f"[{self.key}] OI streams started for "
+            print(f"[{self.key}] OI + tick streams started for "
                   f"{len(self._oi_streams)} underlying futures.")
 
     def _stop_oi_streams(self) -> None:
         for stream in self._oi_streams.values():
             stream.stop()
         self._oi_streams.clear()
+        for stream in self._futures_tick_streams.values():
+            stream.stop()
+        self._futures_tick_streams.clear()
 
     async def _discover_fop(self) -> None:
         futs = await discover_futures(self.ib, self.cfg)
         if not futs:
             print(f"[{self.key}][WARN] No futures found — scanner inactive.")
             return
-
         self.underlying_contracts = futs
-        await asyncio.sleep(1.0)   # pacing
-
-        # Full chain discovery using reqSecDefOptParams (no throttling)
-        # Pass futs to reuse the already-fetched underlying conId
+        await asyncio.sleep(1.0)
         self.option_contracts = await discover_fop_chain(
             self.ib, self.cfg, self.details_cache, futures=futs
         )
@@ -187,14 +159,14 @@ class InstrumentScanner:
         self.underlying_contracts = underlying
         self.option_contracts     = opts
 
-    # ── Tick streams (Option A) ───────────────────────────────────────────────
+    # ── Option tick streams (Option A) ───────────────────────────────────────
 
     def _start_tick_streams(self) -> None:
         for opt in self.option_contracts:
             stream = TickStream(self.ib, opt)
             stream.start()
             self._tick_streams[opt.conId] = stream
-        print(f"[{self.key}] Tick streams started for "
+        print(f"[{self.key}] Option tick streams started for "
               f"{len(self._tick_streams)} contracts.")
 
     def _drain_tick_prints(self) -> list[dict]:
@@ -217,21 +189,12 @@ class InstrumentScanner:
     def _apply_moneyness_prefilter(self,
                                     contracts   : list,
                                     price_map   : dict) -> list:
-        """
-        For FOP instruments: filter option contracts to moneyness band
-        BEFORE requesting quotes, to avoid snapshotting thousands of
-        deep OTM contracts that carry no signal.
-
-        If no underlying price is available, returns all contracts
-        (safe fallback — scanner still works, just slower).
-        """
         if self.cfg['secType'] != 'FOP' or not price_map:
             return contracts
 
-        # Find a valid underlying price from the map
         price = next((v for v in price_map.values() if v and v > 0), None)
         if not price:
-            return contracts   # no price yet — return all, filter later
+            return contracts
 
         lo = price * (1 - cfg.MONEYNESS_BAND)
         hi = price * (1 + cfg.MONEYNESS_BAND)
@@ -240,9 +203,7 @@ class InstrumentScanner:
             c for c in contracts
             if lo <= getattr(c, 'strike', 0) <= hi
         ]
-
         if not filtered:
-            # Fallback: return all if filter is too aggressive
             return contracts
 
         if len(filtered) < len(contracts):
@@ -261,32 +222,31 @@ class InstrumentScanner:
         now = datetime.now(timezone.utc)
         self.alert_manager.tick(self.key)
 
-        # ── 1. Underlying price(s) ─────────────────────────────────────────
+        # ── 1. Drain futures tick streams ─────────────────────────────────
+        momentum_by_conid: dict[int, FuturesMomentum] = {}
+        for conid, ft_stream in self._futures_tick_streams.items():
+            momentum_by_conid[conid] = ft_stream.drain_momentum()
+
+        # ── 2. Underlying price from OI streams ───────────────────────────
         underlying_price_map: dict = {}
 
         if self.cfg['secType'] == 'FOP':
-            fut_tickers = await fetch_snapshot(self.ib, self.underlying_contracts)
             for fut in self.underlying_contracts:
-                t = fut_tickers.get(fut.conId)
-                if t is None:
+                stream = self._oi_streams.get(fut.conId)
+                if stream is None:
                     continue
-                mid = safe_mid(getattr(t, 'bid', None), getattr(t, 'ask', None))
-                if mid is None:
-                    mid = getattr(t, 'last', None) or getattr(t, 'close', None)
-                if mid and mid > 0:
-                    underlying_price_map[fut.conId] = float(mid)
+                p = stream.price()
+                if p is not None and p > 0:
+                    underlying_price_map[fut.conId] = p
+
+            if not underlying_price_map:
+                print(f"[{self.key}][WARN] No underlying price from OI streams "
+                      f"— skipping scan.")
+                return
         else:
-            # Placeholder — filled after option snapshot below
             underlying_price_map['equity'] = None
 
-        # ── 2. Qualify + snapshot option contracts ────────────────────────────
-        # v0.3.0+: qualify only the ±20% moneyness subset from cached ChainSpecs
-        # This replaces the old pre-filter on pre-qualified contracts.
-
-        # For OPT instruments resolve the underlying price NOW (before qualify)
-        # so the moneyness filter can scope the chain correctly.  Without this,
-        # und_price=None causes qualify_chain_for_scan to pass ALL strikes through
-        # (e.g. all 10,450 TSLA contracts instead of the ~200 in the band).
+        # ── 3. OPT: resolve equity price before qualify ───────────────────
         if self.cfg['secType'] == 'OPT':
             early_price: Optional[float] = None
             if self._equity_stream is not None:
@@ -294,15 +254,14 @@ class InstrumentScanner:
             if early_price and early_price > 0:
                 underlying_price_map['equity'] = float(early_price)
             else:
-                print(f"[{self.key}] Skipping scan — underlying price not yet "
-                      f"available (equity market may be closed).")
+                print(f"[{self.key}] Skipping scan — underlying price not yet available.")
                 return
 
+        # ── 4. Qualify + snapshot option contracts ────────────────────────
         und_price = next(
             (v for v in underlying_price_map.values() if v and v > 0), None
         )
         if self._chain_specs:
-            # Qualify the moneyness subset — fast (<30s for ~200 contracts)
             contracts_to_quote = await qualify_chain_for_scan(
                 self.ib,
                 self._chain_specs,
@@ -310,11 +269,10 @@ class InstrumentScanner:
                 cfg.MONEYNESS_BAND,
                 self.details_cache,
             )
-            # Keep underlying_contracts updated from futures stored in cache
             if not self.underlying_contracts and self.cache_manager:
-                self.underlying_contracts =                     self.cache_manager.serve_underlying(self.key)
+                self.underlying_contracts = \
+                    self.cache_manager.serve_underlying(self.key)
         else:
-            # Fallback: use pre-qualified contracts (legacy path)
             contracts_to_quote = self._apply_moneyness_prefilter(
                 self.option_contracts, underlying_price_map
             )
@@ -322,20 +280,14 @@ class InstrumentScanner:
 
         if self.cfg['secType'] == 'OPT':
             equity_price = None
-
-            # 1. Best source: persistent equity stream (opened at startup)
             if self._equity_stream is not None:
                 equity_price = self._equity_stream.price()
-
-            # 2. Fallback: undPrice on option tickers (unreliable but free)
             if not equity_price or equity_price <= 0:
                 for t in opt_tickers.values():
                     val = getattr(t, 'undPrice', None)
                     if val and float(val) > 0:
                         equity_price = float(val)
                         break
-
-            # 3. Fallback: last/close on any option ticker
             if not equity_price or equity_price <= 0:
                 for t in opt_tickers.values():
                     for field in ('last', 'close'):
@@ -345,22 +297,18 @@ class InstrumentScanner:
                             break
                     if equity_price and equity_price > 0:
                         break
-
-            # 4. Fallback: last known price from CacheManager
             if not equity_price or equity_price <= 0:
                 equity_price = (
                     self.cache_manager._last_prices.get(self.key)
                     if self.cache_manager else None
                 )
-
             if equity_price and equity_price > 0:
                 underlying_price_map['equity'] = float(equity_price)
             else:
                 underlying_price_map['equity'] = None
-                print(f"[{self.key}] Could not resolve underlying price "
-                      f"— moneyness filter will pass all strikes through")
+                print(f"[{self.key}] Could not resolve underlying price")
 
-        # ── 3. Build raw DataFrame ─────────────────────────────────────────
+        # ── 5. Build raw DataFrame ────────────────────────────────────────
         rows = []
         for opt in contracts_to_quote:
             t  = opt_tickers.get(opt.conId)
@@ -393,14 +341,14 @@ class InstrumentScanner:
 
         df = pd.DataFrame(rows)
 
-        # ── 4. Liquidity metrics ───────────────────────────────────────────
+        # ── 6. Liquidity metrics ──────────────────────────────────────────
         df = compute_liquidity_metrics(df)
 
-        # ── 5. Moneyness filter ────────────────────────────────────────────
+        # ── 7. Moneyness filter ───────────────────────────────────────────
         def _in_band(row: pd.Series) -> bool:
             price = underlying_price_map.get(row['und_key'])
             if not price or price <= 0:
-                return True   # keep if price unavailable
+                return True
             K = row['strike']
             return (K >= price * (1 - cfg.MONEYNESS_BAND) and
                     K <= price * (1 + cfg.MONEYNESS_BAND))
@@ -408,11 +356,10 @@ class InstrumentScanner:
         df = df[df.apply(_in_band, axis=1)].copy()
 
         if df.empty:
-            print(f"[{self.key}] No options within ±{cfg.MONEYNESS_BAND*100:.0f}% "
-                  f"moneyness band.")
+            print(f"[{self.key}] No options within ±{cfg.MONEYNESS_BAND*100:.0f}% band.")
             return
 
-        # ── 6. IV & Greeks ────────────────────────────────────────────────
+        # ── 8. IV & Greeks ────────────────────────────────────────────────
         iv_col, delta_col, gamma_col, vega_col, theta_col = [], [], [], [], []
 
         for _, row in df.iterrows():
@@ -420,20 +367,11 @@ class InstrumentScanner:
             T     = year_fraction(str(row['expiry']), now)
             mid   = row.get('mid')
 
-            # Skip IV if we have no mid price or no underlying price.
-            # Passing 0.0 wastes solver iterations and produces no useful output.
-            # Skipping explicitly also prevents zero-price noise from entering
-            # iv_skew (which drops NaN rows, so None here is equivalent but faster).
-            # NaN guard: float('nan') is truthy and NaN <= 0 is False, so we
-            # must check math.isnan explicitly — otherwise NaN mid reaches the
-            # solver and Brent fallback returns sigma=10 as the boundary clamp.
             import math as _math
             if (not mid or mid <= 0 or (_math.isfinite(mid) is False)
                     or not price or price <= 0):
-                iv_col.append(None)
-                delta_col.append(None)
-                gamma_col.append(None)
-                vega_col.append(None)
+                iv_col.append(None); delta_col.append(None)
+                gamma_col.append(None); vega_col.append(None)
                 theta_col.append(None)
                 continue
 
@@ -459,30 +397,28 @@ class InstrumentScanner:
         df['vega']  = vega_col
         df['theta'] = theta_col
 
-        # ── 7. Volume history ──────────────────────────────────────────────
+        # ── 9. Volume history ─────────────────────────────────────────────
         call_vol = float(df[df['right'] == 'C']['volume'].fillna(0).sum())
         put_vol  = float(df[df['right'] == 'P']['volume'].fillna(0).sum())
         self.vol_history.record(call_vol, put_vol)
 
-        # Report current underlying price to CacheManager for drift detection
         primary_price_for_cache = next(
             (v for v in underlying_price_map.values() if v and v > 0), None
         )
         if self.cache_manager and primary_price_for_cache:
             self.cache_manager.report_price(self.key, primary_price_for_cache)
 
-        # ── 8. Signal evaluation ───────────────────────────────────────────
+        # ── 10. Signal evaluation ─────────────────────────────────────────
         signal = signal_evaluate(df, self.vol_history)
 
-        # ── 9. Fingerprint ─────────────────────────────────────────────────
+        # ── 11. Fingerprint ───────────────────────────────────────────────
         tick_prints = self._drain_tick_prints() if cfg.USE_STREAMING_TICKS else None
         self.fp_engine.update(self.key, df, tick_prints)
         fp_findings = self.fp_engine.detect(self.key)
 
-        # ── 10. Alerts ─────────────────────────────────────────────────────
+        # ── 12. Alerts ────────────────────────────────────────────────────
         console_alerts: list[str] = []
 
-        # Signal alert
         if signal.composite:
             sig_key = f"signal_{signal.composite}"
             if self.alert_manager.should_fire(self.key, sig_key):
@@ -499,14 +435,7 @@ class InstrumentScanner:
                               'BEARISH', 'STRONG_BEARISH'):
                 self.alert_manager.clear(self.key, f"signal_{direction}")
 
-        # Fingerprint alerts
         for fp in fp_findings:
-            # Key includes finding content so genuinely new patterns fire
-            # even when a different finding of the same type is suppressed.
-            # For findings without expiry/strike/right (volume_cluster,
-            # expiry_concentration) we fold in lot_size or expiry from
-            # evidence so the same persistent position doesn't re-fire
-            # every ALERT_SUPPRESSION_SCANS interval.
             ev       = fp.evidence or {}
             lot_size = ev.get('lot_size', '')
             ev_exp   = '_'.join(str(e) for e in ev.get('keys', [])[:1]) if 'keys' in ev else ''
@@ -522,12 +451,12 @@ class InstrumentScanner:
                 self.alert_manager.mark_fired(self.key, fp_key)
                 self.csv_logger.write_fingerprint_alert(self.key, fp, msg)
 
-        # ── 11. Console output ─────────────────────────────────────────────
+        # ── 13. Console output ────────────────────────────────────────────
         primary_price = next(iter(underlying_price_map.values()), None)
         self._print_scan(now, df, signal, console_alerts,
-                         fp_findings, underlying_price_map)
+                         fp_findings, underlying_price_map, momentum_by_conid)
 
-        # ── 12. CSV ────────────────────────────────────────────────────────
+        # ── 14. CSV ───────────────────────────────────────────────────────
         self.csv_logger.write_scan(self.key, df, signal, primary_price)
 
     # ── Console output ────────────────────────────────────────────────────────
@@ -538,23 +467,59 @@ class InstrumentScanner:
                     signal,
                     alerts           : list[str],
                     fp_findings      : list,
-                    price_map        : dict) -> None:
+                    price_map        : dict,
+                    momentum_map     : 'dict[int, FuturesMomentum]') -> None:
 
-        sep   = '─' * 100
-        ts    = now.strftime('%Y-%m-%d %H:%M:%S UTC')
-        name  = self.cfg['description']
+        sep  = '─' * 100
+        ts   = now.strftime('%Y-%m-%d %H:%M:%S UTC')
+        name = self.cfg['description']
 
         print(f"\n{sep}")
         print(f"  {self.key:6s}  │  {name:40s}  │  {ts}")
         print(sep)
 
-        # Underlying prices
+        # ── Underlying prices ─────────────────────────────────────────────
         for k, v in price_map.items():
             label = 'Underlying' if k == 'equity' else f'Future {k}'
             val   = f"{v:.5g}" if v is not None else 'N/A'
             print(f"  {label}: {val}")
 
-        # Signal summary
+        # ── Futures momentum ──────────────────────────────────────────────
+        if momentum_map:
+            print(f"\n  ── Futures momentum (since last scan) ───────────────────────────")
+            for conid, m in momentum_map.items():
+                sym = m.local_symbol or str(conid)
+                if m.tick_count == 0:
+                    print(f"  {sym:12s}  no ticks")
+                    continue
+
+                delta_str = (f"{m.price_delta:+.3f}" if m.price_delta is not None
+                             else 'N/A')
+                vwap_str  = (f"{m.vwap:.3f}" if m.vwap is not None else 'N/A')
+
+                if m.buy_pct is not None:
+                    sell_pct  = 1.0 - m.buy_pct
+                    buy_str   = f"{m.buy_pct*100:.0f}%"
+                    sell_str  = f"{sell_pct*100:.0f}%"
+                else:
+                    buy_str = sell_str = 'n/c'
+
+                classified_str = (f"{m.classified_pct*100:.0f}%"
+                                  if m.classified_pct is not None else 'n/c')
+
+                arrow = ('▲' if (m.price_delta or 0) > 0
+                         else ('▼' if (m.price_delta or 0) < 0 else '─'))
+
+                print(
+                    f"  {sym:12s}  {arrow} Δ={delta_str:>8s}  "
+                    f"VWAP={vwap_str}  "
+                    f"ticks={m.tick_count:4d}  vol={m.total_vol:7.0f}  "
+                    f"buy={m.buy_vol:6.0f}({buy_str})  "
+                    f"sell={m.sell_vol:6.0f}({sell_str})  "
+                    f"classif={classified_str}"
+                )
+
+        # ── Signal summary ────────────────────────────────────────────────
         comp = signal.composite or 'NONE'
         pc   = f"{signal.pc_ratio:.3f}" if signal.pc_ratio is not None else 'N/A'
         print(
@@ -565,32 +530,57 @@ class InstrumentScanner:
             f"({signal.factors_active}/4 factors active)"
         )
         for factor, direction in signal.factors.items():
-            indicator = direction or 'neutral'
-            print(f"    {factor:<24s}: {indicator}")
+            print(f"    {factor:<24s}: {direction or 'neutral'}")
 
-        # Top 10 by liquidity — only show rows with a real quote or volume.
-        # Without this filter, hundreds of zero-score rows (bid=NaN, vol=0)
-        # all tie at liquidity_score=0.0 and sort randomly to the top.
+        # ── Top 10 by liquidity — filtered to near-expiry ─────────────────
+        # Only show options with a real quote or volume.
         available = [c for c in _DISPLAY_COLS if c in df.columns]
         has_data  = (
             df['bid'].notna() | df['ask'].notna() |
             (pd.to_numeric(df['volume'], errors='coerce').fillna(0) > 0)
         )
         display_df = df[has_data] if has_data.any() else df
-        top10      = display_df.sort_values('liquidity_score', ascending=False).head(10)
-        print(f"\n  Top 10 by liquidity score:")
+
+        # Apply near-expiry filter from config.
+        # DISPLAY_NEAR_EXPIRY_DAYS=0 means disabled (show all expiries).
+        # Fallback: if the filter leaves nothing, show the nearest available
+        # expiry so the table is never blank.
+        near_days = getattr(cfg, 'DISPLAY_NEAR_EXPIRY_DAYS', 2)
+        expiry_label = 'all expiries'
+
+        if near_days > 0 and 'expiry' in display_df.columns:
+            today_str   = now.strftime('%Y%m%d')
+            cutoff_str  = (now + timedelta(days=near_days)).strftime('%Y%m%d')
+            near_mask   = (display_df['expiry'] >= today_str) & \
+                          (display_df['expiry'] <= cutoff_str)
+            near_df     = display_df[near_mask]
+
+            if not near_df.empty:
+                display_df   = near_df
+                expiry_label = (f"expiries within {near_days}d "
+                                f"(≤{cutoff_str})")
+            else:
+                # Nothing in the window — fall back to nearest available expiry
+                available_expiries = sorted(display_df['expiry'].dropna().unique())
+                if available_expiries:
+                    nearest  = available_expiries[0]
+                    display_df   = display_df[display_df['expiry'] == nearest]
+                    expiry_label = f"nearest expiry ({nearest}) — none within {near_days}d"
+
+        top10 = display_df.sort_values('liquidity_score', ascending=False).head(10)
+        print(f"\n  Top 10 by liquidity score ({expiry_label}):")
         with pd.option_context('display.float_format', '{:.4f}'.format,
                                'display.max_columns', 20,
                                'display.width', 200):
             print(top10[available].to_string(index=False))
 
-        # Fingerprint findings
+        # ── Fingerprint findings ──────────────────────────────────────────
         if fp_findings:
             print(f"\n  Fingerprint findings ({len(fp_findings)}):")
             for fp in fp_findings[:5]:
                 print(f"    [{fp.model}][{fp.confidence:.2f}] {fp.note}")
 
-        # Alerts
+        # ── Alerts ────────────────────────────────────────────────────────
         if alerts:
             print(f"\n{'*' * 100}")
             for a in alerts:

@@ -2,23 +2,13 @@
 data/ib_client.py
 -----------------
 All IB Gateway / TWS interactions.
-
-Responsibilities:
-  - connect / disconnect
-  - contract discovery (futures, FOP chains, equity option chains)
-  - snapshot market data (batched, rate-safe)
-  - optional tick-by-tick streaming (Option A)
-  - underlying price resolution (undPrice field or STK fallback)
-
-Design principles:
-  - Every IB call is wrapped in try/except; errors are logged, never raised
-    to the caller (caller gets empty list / None instead)
-  - Batching and staggered sleeps prevent IB pacing violations
-  - No business logic here; this module only fetches and hands back data
 """
 
 import asyncio
+import math
 import time
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -29,17 +19,8 @@ from options_scanner.data.utils import parse_expiry_date, safe_mid
 
 
 # ── Failed-contract cache ────────────────────────────────────────────────────
-# Tracks (symbol, expiry, strike, right) tuples that returned Error 200 from
-# qualifyContractsAsync.  These are skipped in qualify_chain_for_scan for
-# QUALIFY_ERROR_TTL_SEC seconds, avoiding repeated console spam and wasted
-# gateway requests.  The cache is in-memory only — it resets on restart,
-# which is fine because a fresh session re-probes after the TTL.
-#
-# TTL is read from config: QUALIFY_ERROR_TTL_SEC (default 3600 = 1 hour).
 
-_invalid_contract_cache: dict[tuple, float] = {}   # key -> expiry wall-clock time
-
-# Path to the on-disk cache — populated lazily on first _mark_invalid call
+_invalid_contract_cache: dict[tuple, float] = {}
 _INVALID_CACHE_PATH: 'Path | None' = None
 
 
@@ -52,11 +33,6 @@ def _invalid_cache_path() -> 'Path':
 
 
 def _load_invalid_cache() -> None:
-    """
-    Load the persisted invalid-contract cache from disk at startup.
-    Entries whose TTL has already elapsed are silently discarded.
-    Called once by connect() so the first scan benefits immediately.
-    """
     import json
     path = _invalid_cache_path()
     if not path.exists():
@@ -82,13 +58,11 @@ def _load_invalid_cache() -> None:
 
 
 def _save_invalid_cache() -> None:
-    """Persist the invalid-contract cache to disk (called after new entries added)."""
     import json
     path = _invalid_cache_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         now = time.time()
-        # Only write entries that are still live
         raw = {
             f'{sym}|{expiry}|{strike}|{right}': exp
             for (sym, expiry, strike, right), exp
@@ -122,10 +96,6 @@ def _mark_invalid(symbol: str, expiry: str,
 # ── Connection ────────────────────────────────────────────────────────────────
 
 def connect(ib: IB) -> bool:
-    """
-    Connect to IB Gateway / TWS.
-    Returns True on success, False on failure.
-    """
     try:
         ib.connect(cfg.IB_HOST, cfg.IB_PORT, clientId=cfg.IB_CLIENT_ID)
         print(f"[IB] Connected to {cfg.IB_HOST}:{cfg.IB_PORT} "
@@ -150,11 +120,6 @@ def disconnect(ib: IB) -> None:
 async def req_contract_details(ib: IB, contract: Contract,
                                 label: str = '',
                                 timeout: float = 60.0) -> list:
-    """
-    Safe wrapper around reqContractDetailsAsync with timeout.
-    Returns empty list on any failure or timeout.
-    Large chains (CL=25K+, SI=28K+) can take 30-50s — timeout prevents hang.
-    """
     try:
         cds = await asyncio.wait_for(
             ib.reqContractDetailsAsync(contract),
@@ -172,21 +137,12 @@ async def req_contract_details(ib: IB, contract: Contract,
 # ── Futures discovery ─────────────────────────────────────────────────────────
 
 async def discover_futures(ib: IB, instrument_cfg: dict) -> list:
-    """
-    Discover futures contracts for a FOP instrument.
-
-    Window: 62 days (matching the option chain discovery window).
-    MAX_EXPIRY_DAYS (30d) is for scan filtering, not futures discovery.
-
-    Trading class filter: instrument_cfg['futures_trading_class'] if set,
-    otherwise accept the first/primary class IB returns.
-    This prevents SI mini contracts (SILK6, tradingClass='SIL') from being
-    returned instead of standard SI contracts (tradingClass='SI').
-    """
+    """Discover the front FUT_CHAIN_DEPTH futures for a FOP instrument."""
     sym                   = instrument_cfg['symbol']
     exch                  = instrument_cfg['exchange']
     curr                  = instrument_cfg['currency']
     futures_trading_class = instrument_cfg.get('futures_trading_class', None)
+    depth                 = getattr(cfg, 'FUT_CHAIN_DEPTH', 3)
 
     template = Future(symbol=sym, exchange=exch, currency=curr)
     cds = await req_contract_details(
@@ -197,19 +153,18 @@ async def discover_futures(ib: IB, instrument_cfg: dict) -> list:
         return []
 
     now    = datetime.now(timezone.utc)
-    cutoff = now + timedelta(days=62)   # match 2-month option chain window
+    cutoff = now + timedelta(days=62)
 
-    # Determine which tradingClass to use
     if futures_trading_class:
         preferred_tc = futures_trading_class
     else:
-        # Use the most common tradingClass (by count) as the primary series
         from collections import Counter
         tc_counts = Counter(cd.contract.tradingClass for cd in cds)
         preferred_tc = tc_counts.most_common(1)[0][0]
 
     print(f"[IB] {sym} futures: using tradingClass='{preferred_tc}' "
-          f"({sum(1 for cd in cds if cd.contract.tradingClass == preferred_tc)} contracts)")
+          f"({sum(1 for cd in cds if cd.contract.tradingClass == preferred_tc)} contracts), "
+          f"depth={depth}")
 
     qualifying = []
     for cd in cds:
@@ -223,19 +178,16 @@ async def discover_futures(ib: IB, instrument_cfg: dict) -> list:
     qualifying = sorted(qualifying, key=lambda c: c.lastTradeDateOrContractMonth)
 
     if not qualifying:
-        # Fallback: nearest 2 contracts of preferred class regardless of window
         all_tc = sorted(
             (cd.contract for cd in cds if cd.contract.tradingClass == preferred_tc),
             key=lambda c: c.lastTradeDateOrContractMonth,
         )
-        qualifying = all_tc[:2]
+        qualifying = all_tc[:depth]
         print(f"[IB][WARN] No {sym} futures within 62d for class "
               f"'{preferred_tc}'; using nearest {len(qualifying)}.")
+    else:
+        qualifying = qualifying[:depth]
 
-    # Qualify contracts to ensure conIds are primary/canonical.
-    # reqContractDetails can return non-primary conIds that Gateway does not
-    # have FOP chain data for (Gateway log: "Missing per exchange strikes").
-    # qualifyContracts resolves to the primary registered conId.
     print(f"[IB] {sym}: qualifying {len(qualifying)} futures contracts...")
     try:
         qualified = await ib.qualifyContractsAsync(*qualifying)
@@ -246,85 +198,37 @@ async def discover_futures(ib: IB, instrument_cfg: dict) -> list:
         print(f"[IB][WARN] {sym}: futures qualify failed ({e}), "
               f"using unqualified conIds")
 
-    print(f"[IB] {sym}: {len(qualifying)} futures in 62-day window: "
+    print(f"[IB] {sym}: {len(qualifying)} futures in window: "
           f"{[c.localSymbol for c in qualifying]}")
     return qualifying
 
 
-# ── ChainSpec: stores option chain parameters for deferred qualification ─────
-#
-# Instead of qualifying thousands of contracts at cache-build time, we store
-# the chain parameters (expiries, strikes, tradingClass, multiplier) returned
-# by reqSecDefOptParams. Contracts are built and qualified at scan time on the
-# small ±20% moneyness subset (~100-400 contracts), keeping qualification fast
-# and Gateway buffer usage minimal.
-#
-# This eliminates:
-#   - Gateway output buffer overflow (was: 4598 simultaneous qualify responses)
-#   - 8-minute cache build time for TSLA (now: <30s)
-#   - 51% "invalid combo" qualification failures polluting logs
+# ── ChainSpec ─────────────────────────────────────────────────────────────────
 
-from dataclasses import dataclass, field as dc_field
+from dataclasses import dataclass as _dc
 
-@dataclass
+@_dc
 class ChainSpec:
-    """
-    Option chain parameters returned by reqSecDefOptParams.
-    Stored in cache; used to build + qualify contracts at scan time.
-    """
     symbol         : str
-    sec_type       : str            # 'FOP' or 'OPT'
+    sec_type       : str
     exchange       : str
     currency       : str
     trading_class  : str
     multiplier     : str
-    expirations    : set            # set of 'YYYYMMDD' strings
-    strikes        : set            # set of float
-    und_con_id     : int            # conId of the underlying
-    und_symbol     : str = ''       # for reference / logging
+    expirations    : set
+    strikes        : set
+    und_con_id     : int
+    und_symbol     : str = ''
 
 
-# ── FOP chain discovery via reqSecDefOptParams ───────────────────────────────
-#
-# reqSecDefOptParams(symbol, futFopExchange, underlyingSecType, underlyingConId)
-# is the IB-recommended API for option chain discovery. Unlike reqContractDetails
-# it has NO throttling limitation (per IB docs since API v9.72).
-#
-# Key facts confirmed from IB documentation and ib_insync source:
-#   - underlyingConId is the conId of the SPECIFIC futures contract
-#   - Each futures conId returns chains scoped to that future's expiry window
-#   - To get 2 months of chains we call it for the front 2 futures
-#   - qualifyContractsAsync(*contracts) fires all calls via asyncio.gather
-#     simultaneously — we MUST batch to respect the 50 msg/s hard limit
-#   - Batch size 50, sleep 1.1s between batches => ~45 msg/s (safely under limit)
-#   - snapshot=True is incompatible with genericTickList (separate concern)
-#
-# Rate limit: 50 messages/second (hard limit, TWS API docs).
+# ── reqSecDefOptParams ────────────────────────────────────────────────────────
 
-_QUALIFY_BATCH_SIZE  = 25     # contracts per qualifyContractsAsync call
-# Reduced from 50 to 25: IB Gateway has a ~100KB output buffer per client.
-# Firing 50 simultaneous reqContractDetailsAsync calls overflows this buffer,
-# causing Gateway to drop responses ("Output exceeded limit, removed first half").
-# 25 concurrent calls produce less simultaneous output.
-# _QUALIFY_BATCH_SLEEP is read from cfg.QUALIFY_BATCH_SLEEP at runtime (see below)
+_QUALIFY_BATCH_SIZE = 25
 
 
 async def _req_sec_def_opt_params(ib: IB, sym: str, fop_exchange: str,
                                    und_sec_type: str,
                                    und_con_id: int) -> list:
-    """
-    Async wrapper around ib.reqSecDefOptParamsAsync.
-    Returns list of ib_insync.OptionChain objects.
-
-    futFopExchange behaviour per IB docs:
-      - For STK: always pass '' (empty string) — IB example: reqSecDefOptParams(0,"IBM","","STK",8314)
-      - For FOP: pass the specific exchange (e.g. 'NYMEX', 'COMEX').
-        If that returns empty, retry with '' as fallback (some instruments
-        require empty string even for FOP).
-
-    No client-side exchange filtering — we trust IB to scope the result.
-    Trading class filtering is applied downstream in discover_fop_chain.
-    """
     async def _call(exch: str) -> list:
         try:
             chains = await asyncio.wait_for(
@@ -342,7 +246,6 @@ async def _req_sec_def_opt_params(ib: IB, sym: str, fop_exchange: str,
 
     chains = await _call(fop_exchange)
     if not chains and fop_exchange:
-        # Retry with empty string — some FOP instruments require this
         print(f"[IB] {sym}: no chains with exchange='{fop_exchange}', "
               f"retrying with ''...")
         chains = await _call('')
@@ -351,23 +254,10 @@ async def _req_sec_def_opt_params(ib: IB, sym: str, fop_exchange: str,
 
 async def _qualify_contracts_batched(ib: IB, contracts: list,
                                       label: str = '') -> list:
-    """
-    Qualify Contract objects in batches of _QUALIFY_BATCH_SIZE.
-
-    qualifyContractsAsync(*contracts) fires all reqContractDetailsAsync calls
-    concurrently via asyncio.gather. Sending 25K contracts in one call would
-    fire 25K simultaneous requests, violating the 50 msg/s hard limit.
-    We batch to 50 contracts per call with 1.1s sleep between batches.
-
-    Effective rate: 50 msgs / 1.1s ≈ 45 msg/s — safely under the 50 msg/s limit.
-    Sleep occurs BETWEEN batches only (not after the last one).
-
-    Returns only qualified contracts with conId > 0.
-    """
-    qualified  = []
+    qualified     = []
     n_unqualified = 0
     n_timeouts    = 0
-    total      = len(contracts)
+    total         = len(contracts)
     if not total:
         return []
 
@@ -402,11 +292,9 @@ async def _qualify_contracts_batched(ib: IB, contracts: list,
             print(f"[IB] {label}: {done}/{total} sent to qualify, "
                   f"{len(qualified)} valid so far...")
 
-        # Sleep between batches only — not after the last one
         if i + _QUALIFY_BATCH_SIZE < total:
             await asyncio.sleep(cfg.QUALIFY_BATCH_SLEEP)
 
-    # Summary line so we can distinguish "invalid combos" from "Gateway drops"
     print(f"[IB] {label}: qualify complete — "
           f"{len(qualified)} valid, {n_unqualified} invalid combos, "
           f"{n_timeouts} batch timeouts, "
@@ -414,43 +302,24 @@ async def _qualify_contracts_batched(ib: IB, contracts: list,
     return qualified
 
 
+# ── FOP chain discovery ───────────────────────────────────────────────────────
+
 async def discover_fop_chain(ib: IB, instrument_cfg: dict,
                               details_cache: dict,
                               futures: list | None = None) -> list:
-    """
-    Discover the FOP option chain for the front 2 futures using reqSecDefOptParams.
-
-    Process:
-    1. Get the front 2 futures within MAX_EXPIRY_DAYS (or use pre-fetched list)
-    2. For each future, call reqSecDefOptParams(sym, exchange, 'FUT', conId)
-       — this returns (expirations, strikes) per tradingClass for that future
-    3. Deduplicate chains by (tradingClass, frozenset(expirations))
-    4. Filter to preferred_trading_classes if configured
-    5. Filter expiries to within 2 months (62 days) of today
-    6. Build Contract objects for every (expiry, strike, right, tradingClass)
-    7. Qualify in batches of 50 at 45 msg/s to populate conIds
-    8. Build details_cache entries (underConId = the future's conId)
-
-    Why 2 futures: reqSecDefOptParams scopes results to the passed underlyingConId.
-    One future covers one expiry window. Two front-month futures give us the
-    full 2-month chain as requested.
-
-    futures: pre-fetched list of Future Contract objects (avoids a duplicate
-             IB request when contract_cache already fetched them).
-    """
+    """Discover FOP option chain. Includes canonical-underConId fallback for SI/COMEX."""
     sym       = instrument_cfg['symbol']
     exch      = instrument_cfg['exchange']
     curr      = instrument_cfg['currency']
     preferred = instrument_cfg.get('preferred_trading_classes', None)
+    depth     = getattr(cfg, 'FUT_CHAIN_DEPTH', 3)
     now       = datetime.now(timezone.utc)
-    # No cutoff — full chain cached; contracts pruned only when expired
 
-    # ── Step 1: get front 2 futures ───────────────────────────────────────────
     if futures:
         fut_list = sorted(futures,
-                           key=lambda c: c.lastTradeDateOrContractMonth)[:2]
-        print(f"[IB] {sym}: using {len(fut_list)} pre-fetched futures: "
-              f"{[f.localSymbol for f in fut_list]}")
+                           key=lambda c: c.lastTradeDateOrContractMonth)[:depth]
+        print(f"[IB] {sym}: using {len(fut_list)} pre-fetched futures "
+              f"(depth={depth}): {[f.localSymbol for f in fut_list]}")
     else:
         print(f"[IB] {sym}: fetching futures list...")
         fut_cds = await req_contract_details(
@@ -463,11 +332,14 @@ async def discover_fop_chain(ib: IB, instrument_cfg: dict,
         fut_list = sorted(
             (cd.contract for cd in fut_cds),
             key=lambda c: c.lastTradeDateOrContractMonth
-        )[:2]
-        print(f"[IB] {sym}: using front 2 futures: "
+        )[:depth]
+        print(f"[IB] {sym}: using front {len(fut_list)} futures: "
               f"{[f.localSymbol for f in fut_list]}")
 
-    # ── Step 2: reqSecDefOptParams for each future ────────────────────────────
+    if not fut_list:
+        print(f"[IB][WARN] {sym}: no futures in range.")
+        return []
+
     all_chains     : list = []
     seen_chain_keys: set  = set()
 
@@ -486,32 +358,18 @@ async def discover_fop_chain(ib: IB, instrument_cfg: dict,
                 new_count += 1
         print(f"[IB] {sym}: {new_count} new chains from {fut.localSymbol} "
               f"(total unique: {len(all_chains)})")
-        await asyncio.sleep(0.3)  # light pacing between futures
+        await asyncio.sleep(0.3)
 
-    # ── Fallback: reqSecDefOptParams returned nothing for all futures ─────────
-    # This happens for some instruments (e.g. SI/COMEX) where IB's Gateway
-    # does not have FOP chain data registered against the dated futures conIds.
-    #
-    # Root cause (confirmed from IBKR article "Handling Options Chains" and
-    # Gateway logs): reqSecDefOptParams requires the CANONICAL underlying conId,
-    # not a dated futures contract conId. For SI, SIK6 (conId=712566019) is a
-    # dated contract; the canonical SI underlying conId is different.
-    #
-    # Fix: qualify a generic (undated) FUT contract to get the canonical conId,
-    # then retry reqSecDefOptParams with that. This mirrors what the IBKR Web API
-    # article describes: /secdef/search returns the canonical underConid, which
-    # is then used for strike/expiry lookups — not the dated futures conId.
+    # ── Canonical underConId fallback (SI/COMEX) ──────────────────────────────
     if not all_chains:
         print(f"[IB] {sym}: reqSecDefOptParams found nothing via dated futures conIds.")
         print(f"[IB] {sym}: trying canonical underlying conId via generic FUT qualify...")
 
-        # Qualify a generic (undated) FUT to get the canonical underlying conId
         generic_fut          = Contract()
         generic_fut.symbol   = sym
         generic_fut.secType  = 'FUT'
         generic_fut.exchange = exch
         generic_fut.currency = curr
-        # No lastTradeDateOrContractMonth — let IB resolve to canonical contract
         try:
             qualified_futs = await ib.qualifyContractsAsync(generic_fut)
             canonical_ids = sorted(set(
@@ -522,8 +380,6 @@ async def discover_fop_chain(ib: IB, instrument_cfg: dict,
             print(f"[IB][WARN] {sym}: generic FUT qualify failed: {e}")
             canonical_ids = []
 
-        # Also probe via reqContractDetails on a generic FOP — IB returns
-        # underConId in ContractDetails which is always the canonical ID
         if not canonical_ids:
             print(f"[IB] {sym}: falling back to reqContractDetails FOP probe...")
             generic_fop          = Contract()
@@ -566,7 +422,6 @@ async def discover_fop_chain(ib: IB, instrument_cfg: dict,
         print(f"[IB][WARN] {sym}: reqSecDefOptParams returned no chains.")
         return []
 
-    # ── Step 3: log trading class summary ────────────────────────────────────
     from collections import defaultdict
     tc_exp: dict = defaultdict(set)
     tc_str: dict = defaultdict(set)
@@ -577,7 +432,6 @@ async def discover_fop_chain(ib: IB, instrument_cfg: dict,
     print(f"[IB] {sym} chains (pre-filter): "
           f"{dict(sorted(tc_summary.items(), key=lambda x: -x[1]))}")
 
-    # ── Step 4: filter to preferred trading classes ───────────────────────────
     if preferred is not None:
         all_chains = [c for c in all_chains if c.tradingClass in preferred]
         print(f"[IB] {sym}: {len(all_chains)} chains after "
@@ -587,20 +441,14 @@ async def discover_fop_chain(ib: IB, instrument_cfg: dict,
         print(f"[IB][WARN] {sym}: no chains after filter.")
         return []
 
-    # ── Step 5: build ChainSpec objects (no qualification needed) ────────────
-    # Store the FULL chain — all expiries that have not yet expired.
-    # No moneyness or time-window filter here: contracts only leave the cache
-    # when their expiry date has passed.  Moneyness filtering happens at scan
-    # time inside qualify_chain_for_scan().
     chain_specs: list[ChainSpec] = []
 
     for chain in all_chains:
-        # Only exclude expiries that are already in the past
         valid_expiries = set()
         for expiry in chain.expirations:
             exp_dt = parse_expiry_date(expiry)
             if exp_dt is not None and exp_dt < now:
-                continue   # already expired — skip
+                continue
             valid_expiries.add(expiry)
 
         if not valid_expiries:
@@ -623,8 +471,7 @@ async def discover_fop_chain(ib: IB, instrument_cfg: dict,
         len(s.expirations) * len(s.strikes) * 2 for s in chain_specs
     )
     print(f"[IB] {sym} FOP: {len(chain_specs)} chain specs cached "
-          f"({total_combos} theoretical contracts across all non-expired expiries, "
-          f"qualify at scan time on ±20% subset)")
+          f"({total_combos} theoretical contracts)")
     return chain_specs
 
 
@@ -632,31 +479,18 @@ async def discover_fop_chain(ib: IB, instrument_cfg: dict,
 
 async def discover_equity_options(ib: IB, instrument_cfg: dict,
                                    details_cache: dict) -> tuple[list, list]:
-    """
-    Discover equity underlying + option chain using reqSecDefOptParams.
-
-    Process:
-    1. Qualify the STK contract to get underlyingConId
-    2. reqSecDefOptParams(sym, '', 'STK', conId) — no throttling
-    3. Select SMART/primary tradingClass chain
-    4. Filter to 2-month expiry window
-    5. Build Contract objects, qualify in batches of 50 at 45 msg/s
-    """
     sym  = instrument_cfg['symbol']
     exch = instrument_cfg.get('exchange', 'SMART')
     curr = instrument_cfg['currency']
-    now = datetime.now(timezone.utc)
-    # No cutoff — full chain cached; contracts pruned only when expired
+    now  = datetime.now(timezone.utc)
 
-    # ── Step 1: qualify STK ───────────────────────────────────────────────────
     stk          = Contract()
     stk.symbol   = sym
     stk.secType  = 'STK'
     stk.exchange = exch
     stk.currency = curr
 
-    stk_cds = await req_contract_details(ib, stk, label=f"{sym} STK",
-                                          timeout=60.0)
+    stk_cds = await req_contract_details(ib, stk, label=f"{sym} STK", timeout=60.0)
     if not stk_cds:
         print(f"[IB][WARN] {sym}: STK not found.")
         return [], []
@@ -665,47 +499,35 @@ async def discover_equity_options(ib: IB, instrument_cfg: dict,
     und_con_id = underlying[0].conId
     print(f"[IB] {sym}: STK conId={und_con_id}")
 
-    # ── Step 2: reqSecDefOptParams ────────────────────────────────────────────
     print(f"[IB] {sym}: reqSecDefOptParams...")
     chains = await _req_sec_def_opt_params(ib, sym, '', 'STK', und_con_id)
     if not chains:
         print(f"[IB][WARN] {sym}: no chains returned.")
         return underlying, []
 
-    # Log all chains
     from collections import defaultdict
     chain_info = {f"{c.exchange}/{c.tradingClass}":
                   len(c.expirations)*len(c.strikes)*2 for c in chains}
     print(f"[IB] {sym} OPT chains: "
           f"{dict(sorted(chain_info.items(), key=lambda x: -x[1]))}")
 
-    # Select: SMART exchange + tradingClass == symbol (primary chain)
     primary = [c for c in chains
                if c.exchange == 'SMART' and c.tradingClass == sym]
     if not primary:
         primary = [c for c in chains if c.exchange == 'SMART']
     if not primary:
         primary = chains
-    print(f"[IB] {sym}: using {len(primary)} chain(s) for build")
 
-    # ── Step 3: build ChainSpec objects (no qualification at cache time) ──────
-    # Store the FULL chain — all non-expired expiries.
-    # No moneyness or time-window filter here: contracts only leave the cache
-    # when their expiry date has passed.  Moneyness filtering happens at scan
-    # time inside qualify_chain_for_scan().
     chain_specs: list[ChainSpec] = []
-
     for chain in primary:
         valid_expiries = set()
         for expiry in chain.expirations:
             exp_dt = parse_expiry_date(expiry)
             if exp_dt is not None and exp_dt < now:
-                continue   # already expired — skip
+                continue
             valid_expiries.add(expiry)
-
         if not valid_expiries:
             continue
-
         chain_specs.append(ChainSpec(
             symbol        = sym,
             sec_type      = 'OPT',
@@ -719,12 +541,9 @@ async def discover_equity_options(ib: IB, instrument_cfg: dict,
             und_symbol    = sym,
         ))
 
-    total_combos = sum(
-        len(s.expirations) * len(s.strikes) * 2 for s in chain_specs
-    )
+    total_combos = sum(len(s.expirations)*len(s.strikes)*2 for s in chain_specs)
     print(f"[IB] {sym} OPT: {len(chain_specs)} chain specs cached "
-          f"({total_combos} theoretical contracts across all non-expired expiries, "
-          f"qualify at scan time on ±20% subset)")
+          f"({total_combos} theoretical contracts)")
     return underlying, chain_specs
 
 
@@ -736,31 +555,36 @@ async def qualify_chain_for_scan(ib: IB,
                                   moneyness_band: float,
                                   details_cache: dict) -> list:
     """
-    At scan time: build and qualify the option contracts from cached ChainSpecs
-    that fall within the moneyness band around the current underlying price.
-
-    This is the only point where qualifyContractsAsync is called.
-    With a ±20% band and typical chains, this produces ~100-400 contracts —
-    far fewer than the full theoretical matrix and well within Gateway limits.
-
-    Returns list of qualified Contract objects.
-    Populates details_cache[conId] = SimpleNamespace(contract, underConId).
+    Qualify options within the moneyness band.
+    Contracts already in details_cache are reused — no IB round-trip.
+    Only new contracts in the band are sent to qualifyContractsAsync.
     """
     from ib_insync import Contract as IBContract
     from types import SimpleNamespace
 
-    raw: list = []
-    n_skipped_invalid = 0
+    _existing_key_to_conid: dict[tuple, int] = {
+        (cd.contract.symbol,
+         cd.contract.lastTradeDateOrContractMonth,
+         cd.contract.strike,
+         cd.contract.right): conid
+        for conid, cd in details_cache.items()
+        if hasattr(cd, 'contract')
+    }
+
+    raw: list               = []
+    already_qualified: list = []
+    n_skipped_invalid       = 0
+    n_cache_hits            = 0
+
+    if underlying_price and underlying_price > 0:
+        lo = underlying_price * (1 - moneyness_band)
+        hi = underlying_price * (1 + moneyness_band)
+    else:
+        lo, hi = 0.0, float('inf')
+
+    now = datetime.now(timezone.utc)
 
     for spec in chain_specs:
-        # Moneyness filter (skip if no price available — include all)
-        if underlying_price and underlying_price > 0:
-            lo = underlying_price * (1 - moneyness_band)
-            hi = underlying_price * (1 + moneyness_band)
-        else:
-            lo, hi = 0.0, float('inf')
-
-        now = datetime.now(timezone.utc)
         for expiry in sorted(spec.expirations):
             exp_dt = parse_expiry_date(expiry)
             if exp_dt is None or exp_dt < now:
@@ -769,13 +593,18 @@ async def qualify_chain_for_scan(ib: IB,
                 if not (lo <= strike <= hi):
                     continue
                 for right in ('C', 'P'):
-                    # Skip contracts that previously returned Error 200 and
-                    # whose TTL has not yet expired.  This avoids re-sending
-                    # known-invalid combos (e.g. TSLA LEAPS with 2.5pt strike
-                    # spacing) on every scan, eliminating the console spam.
+                    cache_key = (spec.symbol, expiry, strike, right)
+
                     if _is_invalid_cached(spec.symbol, expiry, strike, right):
                         n_skipped_invalid += 1
                         continue
+
+                    existing_conid = _existing_key_to_conid.get(cache_key)
+                    if existing_conid is not None:
+                        already_qualified.append(details_cache[existing_conid].contract)
+                        n_cache_hits += 1
+                        continue
+
                     ct = IBContract()
                     ct.symbol        = spec.symbol
                     ct.secType       = spec.sec_type
@@ -788,22 +617,17 @@ async def qualify_chain_for_scan(ib: IB,
                     ct.tradingClass  = spec.trading_class
                     raw.append((ct, spec.und_con_id))
 
-    if not raw and n_skipped_invalid == 0:
-        return []
-
-    contracts    = [ct for ct, _ in raw]
-    und_con_ids  = {id(ct): uid for ct, uid in raw}
-
     und_price_str = f"{underlying_price:.4g}" if underlying_price else 'N/A'
-    skip_note = f", {n_skipped_invalid} skipped (cached invalid)" if n_skipped_invalid else ""
-    print(f"[IB] qualify_chain_for_scan: {len(contracts)} contracts "
-          f"(±{moneyness_band*100:.0f}% of {und_price_str}{skip_note})")
+    print(f"[IB] qualify_chain_for_scan: {len(raw)} to qualify, "
+          f"{n_cache_hits} reused, {n_skipped_invalid} invalid "
+          f"(±{moneyness_band*100:.0f}% of {und_price_str})")
 
-    if not contracts:
-        return []
+    if not raw:
+        return already_qualified
 
-    # Build a lookup from contract identity to its key tuple so we can
-    # learn which contracts failed after the qualify call returns.
+    contracts   = [ct for ct, _ in raw]
+    und_con_ids = {id(ct): uid for ct, uid in raw}
+
     contract_keys: dict[int, tuple] = {
         id(ct): (ct.symbol,
                  ct.lastTradeDateOrContractMonth,
@@ -812,12 +636,8 @@ async def qualify_chain_for_scan(ib: IB,
         for ct in contracts
     }
 
-    qualified = await _qualify_contracts_batched(
-        ib, contracts, label='scan'
-    )
+    qualified = await _qualify_contracts_batched(ib, contracts, label='scan')
 
-    # Learn failures: any contract we sent that did NOT come back qualified
-    # (and has no conId > 0) is marked invalid for QUALIFY_ERROR_TTL_SEC.
     qualified_ids = {ct.conId for ct in qualified if getattr(ct, 'conId', 0) > 0}
     n_newly_cached = 0
     for ct in contracts:
@@ -833,31 +653,20 @@ async def qualify_chain_for_scan(ib: IB,
               f"cached (suppressed for {ttl//60}min)")
         _save_invalid_cache()
 
+    from types import SimpleNamespace as _SN
     for ct in qualified:
-        cd            = SimpleNamespace()
+        cd            = _SN()
         cd.contract   = ct
         cd.underConId = und_con_ids.get(id(ct), 0)
         details_cache[ct.conId] = cd
 
-    return qualified
+    return already_qualified + qualified
 
 
 # ── Snapshot market data ──────────────────────────────────────────────────────
 
 async def fetch_snapshot(ib: IB, contracts: list,
                           timeout: float = None) -> dict:
-    """
-    Fetch snapshot market data for a list of contracts.
-    Returns dict: conId -> ticker.
-
-    Sends requests in batches of IB_BATCH_SIZE.  After each batch we wait
-    up to per_batch_timeout seconds for that batch to fill before moving on.
-    This prevents a huge chain from blocking forever — each batch is
-    time-bounded independently.
-
-    snapshot=True is incompatible with genericTickList on IB — generic ticks
-    require a persistent non-snapshot stream.  We use empty genericTickList.
-    """
     if not contracts:
         return {}
 
@@ -876,7 +685,6 @@ async def fetch_snapshot(ib: IB, contracts: list,
             except Exception as e:
                 print(f"[IB][WARN] reqMktData failed conId={c.conId}: {e}")
 
-        # Wait for this batch to fill (time-bounded per batch)
         deadline = time.time() + per_batch_timeout
         while time.time() < deadline:
             filled = sum(
@@ -888,7 +696,6 @@ async def fetch_snapshot(ib: IB, contracts: list,
             await asyncio.sleep(0.2)
 
         tickers.update(batch_tickers)
-        # Small inter-batch pause to respect IB pacing
         await asyncio.sleep(0.3)
 
     return tickers
@@ -899,20 +706,12 @@ async def fetch_snapshot(ib: IB, contracts: list,
 async def resolve_underlying_price(ib: IB,
                                     instrument_cfg: dict,
                                     opt_tickers: dict) -> Optional[float]:
-    """
-    For equity instruments: try undPrice from any option ticker first,
-    then fall back to a fresh STK snapshot.
-    NOTE: undPrice is unreliable on IB snapshots — prefer start_equity_stream()
-    for a persistent underlying quote that is updated every scan.
-    """
-    # Try undPrice from option tickers (unreliable but zero cost to check)
     if instrument_cfg.get('use_und_price_field', True):
         for t in opt_tickers.values():
             und = getattr(t, 'undPrice', None)
             if und and float(und) > 0:
                 return float(und)
 
-    # STK snapshot fallback
     sym  = instrument_cfg['symbol']
     exch = instrument_cfg.get('exchange', 'SMART')
     curr = instrument_cfg['currency']
@@ -938,20 +737,10 @@ async def resolve_underlying_price(ib: IB,
     return float(price) if price else None
 
 
+# ── EquityStream ──────────────────────────────────────────────────────────────
+
 class EquityStream:
-    """
-    Persistent streaming quote for an equity underlying (STK).
-
-    IB only populates undPrice on option tickers when a live streaming
-    quote for the underlying is open simultaneously.  This class opens
-    that stream at scanner startup and keeps it alive across scan cycles.
-
-    Usage:
-        stream = EquityStream(ib, instrument_cfg)
-        await stream.start()           # once at startup
-        price  = stream.price()        # called each scan — always instant
-        stream.stop()                  # on shutdown
-    """
+    """Persistent streaming quote for an equity underlying (STK)."""
 
     def __init__(self, ib: IB, instrument_cfg: dict):
         self._ib      = ib
@@ -978,14 +767,12 @@ class EquityStream:
 
         self._contract = cds[0].contract
         try:
-            # Persistent (non-snapshot) streaming quote
             self._ticker = self._ib.reqMktData(
                 self._contract,
                 genericTickList='100,101,104,106',
                 snapshot=False,
                 regulatorySnapshot=False,
             )
-            # Wait briefly for first price to arrive
             deadline = time.time() + 5.0
             while time.time() < deadline:
                 if self.price() is not None:
@@ -998,7 +785,6 @@ class EquityStream:
             print(f"[IB][WARN] Equity stream failed for {sym}: {e}")
 
     def price(self) -> Optional[float]:
-        """Return current mid/last/close from the streaming ticker."""
         if self._ticker is None:
             return None
         t = self._ticker
@@ -1021,15 +807,10 @@ class EquityStream:
             self._contract = None
 
 
-# ── Tick-by-tick streaming (Option A) ────────────────────────────────────────
+# ── TickStream (option contracts, Option A) ───────────────────────────────────
 
 class TickStream:
-    """
-    Manages a tick-by-tick stream for one contract.
-    Collects prints into a buffer; caller drains the buffer each scan.
-
-    Only active when USE_STREAMING_TICKS=True.
-    """
+    """Tick-by-tick stream for one option contract (USE_STREAMING_TICKS=True)."""
 
     def __init__(self, ib: IB, contract: Contract):
         self._ib       = ib
@@ -1055,12 +836,11 @@ class TickStream:
                 pass
 
     def drain(self) -> list[dict]:
-        """Return and clear buffered prints."""
         buf          = self._prints[:]
         self._prints = []
         return buf
 
-    def _on_tick(self, ticker, tick_type, *args) -> None:
+    def _on_tick(self, ticker, *args) -> None:
         try:
             self._prints.append({
                 'ts'    : datetime.now(timezone.utc).isoformat(),
@@ -1072,37 +852,13 @@ class TickStream:
             pass
 
 
-# ── OI streaming for FOP underlyings ─────────────────────────────────────────
+# ── OIStream ──────────────────────────────────────────────────────────────────
 
 class OIStream:
     """
-    Persistent streaming quote for a FOP underlying future.
-
-    IB does not populate OI on snapshot=True requests (snapshot is
-    incompatible with genericTickList).  This class opens a persistent
-    non-snapshot stream per underlying future and makes the latest open
-    interest available to the scan loop via oi().
-
-    Correct generic tick for FUTURES open interest:
-      genericTickList='588'  →  Futures Open Interest
-      Delivered via tickSize() as tick ID 86.
-      Accessible in ib_insync as Ticker.futuresOpenInterest.
-
-    Do NOT use tick 101 (Option Call/Put OI — aggregate for the
-    underlying's option chain, tick IDs 27/28) or tick 22 (deprecated,
-    no longer populated by IB).
-
-    Usage (from InstrumentScanner):
-        stream = OIStream(ib, future_contract)
-        await stream.start()           # once at startup / discovery
-        oi_value = stream.oi()         # called each scan — always instant
-        stream.stop()                  # on shutdown
-
-    One OIStream per underlying contract is sufficient for the macro OI
-    picture used by OIPCSignalModel.  Option-level OI (per strike/expiry)
-    still comes from the option snapshot rows — IB only populates those
-    after at least one session with a persistent stream active.
-    OIPCSignalModel handles None gracefully via oi_pc_min_observations.
+    Persistent non-snapshot stream for a FOP underlying future.
+    genericTickList='588' → Futures Open Interest (tick 86).
+    Also delivers price ticks (bid/ask/last/close) via price().
     """
 
     def __init__(self, ib: IB, contract: Contract):
@@ -1113,15 +869,12 @@ class OIStream:
     async def start(self) -> None:
         sym = getattr(self._contract, 'symbol', str(self._contract.conId))
         try:
-            # genericTickList '588' = Futures Open Interest (tick 86)
-            # snapshot=False required — snapshot is incompatible with genericTickList
             self._ticker = self._ib.reqMktData(
                 self._contract,
                 genericTickList='588',
                 snapshot=False,
                 regulatorySnapshot=False,
             )
-            # Wait briefly for the first OI tick to arrive
             deadline = time.time() + 5.0
             while time.time() < deadline:
                 if self.oi() is not None:
@@ -1135,11 +888,21 @@ class OIStream:
             print(f"[IB][WARN] OI stream failed for {sym} "
                   f"(conId={self._contract.conId}): {e}")
 
+    def price(self) -> Optional[float]:
+        """Return mid/last/close from the persistent futures stream."""
+        if self._ticker is None:
+            return None
+        t = self._ticker
+        p = safe_mid(getattr(t, 'bid', None), getattr(t, 'ask', None))
+        if p is not None and p > 0:
+            return p
+        for field in ('last', 'close'):
+            v = getattr(t, field, None)
+            if v is not None and float(v) > 0:
+                return float(v)
+        return None
+
     def oi(self) -> Optional[float]:
-        """
-        Return the latest futures open interest, or None if not yet received.
-        Reads Ticker.futuresOpenInterest (tick ID 86, generic tick 588).
-        """
         if self._ticker is None:
             return None
         val = getattr(self._ticker, 'futuresOpenInterest', None)
@@ -1154,3 +917,224 @@ class OIStream:
             except Exception:
                 pass
             self._ticker = None
+
+
+# ── FuturesTickStream ─────────────────────────────────────────────────────────
+
+@dataclass
+class FuturesMomentum:
+    """
+    Momentum snapshot for one futures contract over one scan window.
+
+    buy_vol / sell_vol:
+      Aggressor side inferred by comparing trade price to prevailing bid/ask
+      from the co-located OIStream ticker.
+        last >= ask  → buy-initiated (lifting the offer)
+        last <= bid  → sell-initiated (hitting the bid)
+        bid < last < ask → unclassified (price improvement or inside spread)
+
+      IB does not provide an aggressor-side flag on tick data.
+      TickAttribLast only has pastLimit (trade through limit) and unreported
+      — neither gives direction. Bid/ask comparison is the industry standard
+      for futures aggressor inference.
+
+    buy_pct: buy_vol / (buy_vol + sell_vol) — fraction of CLASSIFIED volume.
+             This always sums to 100% with sell_pct for classified trades.
+    classified_pct: (buy_vol + sell_vol) / total_vol — how much was classifiable.
+                    Low classified_pct means bid/ask was unavailable or wide.
+    """
+    symbol          : str
+    local_symbol    : str
+    price_first     : Optional[float] = None
+    price_last      : Optional[float] = None
+    price_delta     : Optional[float] = None   # last - first
+    vwap            : Optional[float] = None
+    buy_vol         : float = 0.0
+    sell_vol        : float = 0.0
+    total_vol       : float = 0.0
+    tick_count      : int   = 0
+    buy_pct         : Optional[float] = None   # buy / (buy+sell), None if no classified
+    classified_pct  : Optional[float] = None   # (buy+sell) / total, None if no total
+
+
+class FuturesTickStream:
+    """
+    Tick-by-tick stream for a futures contract using reqTickByTickData('AllLast').
+
+    IB API tick-by-tick data (ib_insync):
+      reqTickByTickData returns a Ticker object.
+      Each tick-by-tick update appends a TickByTickAllLast namedtuple to
+      ticker.tickByTicks and fires ticker.updateEvent.
+
+      TickByTickAllLast fields (from ib_insync.objects):
+        tickType          : int   (1=Last, 2=AllLast)
+        time              : datetime
+        price             : float
+        size              : float
+        tickAttribLast    : TickAttribLast (pastLimit: bool, unreported: bool)
+        exchange          : str
+        specialConditions : str
+
+      tickAttribLast.pastLimit: True if trade was at/through the limit price.
+      This is NOT an aggressor-side flag — it only means the trade filled
+      past the prevailing limit. Direction must be inferred from bid/ask.
+
+      IB does not provide aggressor side on futures ticks. The correct
+      method is bid/ask comparison using the live OIStream quote:
+        price >= ask → buy-initiated
+        price <= bid → sell-initiated
+        between     → unclassified
+
+    _on_tick drains ticker.tickByTicks (the list of new ticks since last
+    update) rather than reading ticker.last/lastSize (level-1 stream values
+    which are not individual tick-by-tick prints).
+
+    Note on subscription limits: ib_insync tick-by-tick streams are limited
+    to 3 simultaneous subscriptions per client. With FUT_CHAIN_DEPTH=3 this
+    uses all 3 slots for CL. If other tick streams are needed, reduce depth.
+    """
+
+    BUFFER_MAX = 5000
+
+    def __init__(self, ib: IB, contract: Contract):
+        self._ib          = ib
+        self._contract    = contract
+        self._ticker      = None
+        self._oi_ticker   = None   # set by instrument.py after OIStream starts
+        self._buf: deque  = deque(maxlen=self.BUFFER_MAX)
+        self._sym         = getattr(contract, 'localSymbol',
+                                    getattr(contract, 'symbol',
+                                            str(contract.conId)))
+
+    def set_oi_ticker(self, oi_ticker) -> None:
+        """
+        Provide the OIStream's internal ticker for live bid/ask access.
+        Called by instrument.py after _start_oi_streams().
+        The OIStream ticker is a reqMktData non-snapshot stream that always
+        has current bid/ask for the underlying future.
+        """
+        self._oi_ticker = oi_ticker
+
+    def start(self) -> None:
+        sym = self._sym
+        try:
+            self._ticker = self._ib.reqTickByTickData(
+                self._contract,
+                tickType      = 'AllLast',   # required for futures; 'Last' is equities only
+                numberOfTicks = 0,           # continuous stream
+                ignoreSize    = False,
+            )
+            self._ticker.updateEvent += self._on_tick
+            print(f"[IB] FuturesTickStream started for {sym} "
+                  f"(conId={self._contract.conId})")
+        except Exception as e:
+            print(f"[IB][WARN] FuturesTickStream failed for {sym}: {e}")
+
+    def stop(self) -> None:
+        if self._ticker is not None:
+            try:
+                self._ib.cancelTickByTickData(self._ticker)
+            except Exception:
+                pass
+            self._ticker = None
+
+    def _on_tick(self, ticker, *args) -> None:
+        """
+        Called by ib_insync on each updateEvent for the ticker.
+        Drains ticker.tickByTicks — the list of new TickByTickAllLast
+        objects appended since the last event.
+
+        Does NOT read ticker.last / ticker.lastSize — those are level-1
+        reqMktData stream values, not individual tick-by-tick prints.
+        """
+        try:
+            # Snapshot bid/ask once per event for all ticks in this batch
+            bid = ask = None
+            if self._oi_ticker is not None:
+                b = getattr(self._oi_ticker, 'bid', None)
+                a = getattr(self._oi_ticker, 'ask', None)
+                if b is not None and not math.isnan(float(b)) and float(b) > 0:
+                    bid = float(b)
+                if a is not None and not math.isnan(float(a)) and float(a) > 0:
+                    ask = float(a)
+
+            # Drain all new tick-by-tick prints from this event
+            for t in ticker.tickByTicks:
+                price = getattr(t, 'price', None)
+                size  = getattr(t, 'size',  None)
+                if price is None or size is None:
+                    continue
+                try:
+                    price = float(price)
+                    size  = float(size)
+                except (TypeError, ValueError):
+                    continue
+                if price <= 0 or size < 0:
+                    continue
+                self._buf.append({
+                    'price': price,
+                    'size' : size,
+                    'bid'  : bid,
+                    'ask'  : ask,
+                })
+        except Exception:
+            pass
+
+    def drain_momentum(self) -> 'FuturesMomentum':
+        """
+        Consume all buffered ticks and return a FuturesMomentum snapshot.
+        Buffer is cleared after each call.
+
+        buy_pct is computed as buy_vol / (buy_vol + sell_vol) — fraction of
+        classified volume only.  This correctly sums to 100% with sell_pct.
+
+        classified_pct = (buy_vol + sell_vol) / total_vol shows how much
+        of the volume was classifiable. Low values mean wide spreads or
+        missing bid/ask at time of trade.
+        """
+        ticks = list(self._buf)
+        self._buf.clear()
+
+        sym  = getattr(self._contract, 'symbol', '')
+        lsym = self._sym
+        m    = FuturesMomentum(symbol=sym, local_symbol=lsym)
+
+        if not ticks:
+            return m
+
+        m.tick_count = len(ticks)
+        prices  = [t['price'] for t in ticks]
+        sizes   = [t['size']  for t in ticks]
+
+        m.price_first = prices[0]
+        m.price_last  = prices[-1]
+        m.price_delta = m.price_last - m.price_first
+
+        total_vol   = sum(sizes)
+        m.total_vol = total_vol
+
+        if total_vol > 0:
+            m.vwap = sum(p * s for p, s in zip(prices, sizes)) / total_vol
+
+        # Buy / sell classification via bid/ask comparison
+        buy_vol = sell_vol = 0.0
+        for t in ticks:
+            s, p, bid, ask = t['size'], t['price'], t['bid'], t['ask']
+            if bid is not None and ask is not None:
+                if p >= ask:
+                    buy_vol  += s
+                elif p <= bid:
+                    sell_vol += s
+                # else: unclassified — between bid/ask, not counted either side
+
+        m.buy_vol  = buy_vol
+        m.sell_vol = sell_vol
+
+        classified = buy_vol + sell_vol
+        if classified > 0:
+            # buy_pct as fraction of CLASSIFIED volume only — always sums to 100% with sell_pct
+            m.buy_pct = buy_vol / classified
+        if total_vol > 0:
+            m.classified_pct = classified / total_vol
+
+        return m

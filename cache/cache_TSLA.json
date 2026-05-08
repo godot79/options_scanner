@@ -1,8 +1,8 @@
 {
   "version": "0.3.0",
   "instrument": "TSLA",
-  "discovered_at": "2026-05-05T11:44:32.378494+00:00",
-  "underlying_price_at_discovery": null,
+  "discovered_at": "2026-05-07T11:15:38.380510+00:00",
+  "underlying_price_at_discovery": 405.40999999999997,
   "futures": [],
   "chain_specs": [
     {
@@ -13,7 +13,6 @@
       "trading_class": "TSLA",
       "multiplier": "100",
       "expirations": [
-        "20260506",
         "20260508",
         "20260511",
         "20260513",
