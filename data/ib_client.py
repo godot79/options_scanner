@@ -75,9 +75,9 @@ def _save_invalid_cache() -> None:
         print(f"[IB][WARN] Could not save invalid-contract cache: {e}")
 
 
-def _is_invalid_cached(symbol: str, expiry: str,
+def _is_invalid_cached(sym: str, expiry: str,
                         strike: float, right: str) -> bool:
-    key = (symbol, expiry, strike, right)
+    key = (sym, expiry, strike, right)
     exp = _invalid_contract_cache.get(key)
     if exp is None:
         return False
@@ -87,10 +87,9 @@ def _is_invalid_cached(symbol: str, expiry: str,
     return True
 
 
-def _mark_invalid(symbol: str, expiry: str,
-                   strike: float, right: str) -> None:
+def _mark_invalid(sym: str, expiry: str, strike: float, right: str) -> None:
     ttl = getattr(cfg, 'QUALIFY_ERROR_TTL_SEC', 3600)
-    _invalid_contract_cache[(symbol, expiry, strike, right)] = time.time() + ttl
+    _invalid_contract_cache[(sym, expiry, strike, right)] = time.time() + ttl
 
 
 # ── Connection ────────────────────────────────────────────────────────────────
@@ -137,12 +136,10 @@ async def req_contract_details(ib: IB, contract: Contract,
 # ── Futures discovery ─────────────────────────────────────────────────────────
 
 async def discover_futures(ib: IB, instrument_cfg: dict) -> list:
-    """Discover the front FUT_CHAIN_DEPTH futures for a FOP instrument."""
     sym                   = instrument_cfg['symbol']
     exch                  = instrument_cfg['exchange']
     curr                  = instrument_cfg['currency']
     futures_trading_class = instrument_cfg.get('futures_trading_class', None)
-    depth                 = getattr(cfg, 'FUT_CHAIN_DEPTH', 3)
 
     template = Future(symbol=sym, exchange=exch, currency=curr)
     cds = await req_contract_details(
@@ -159,12 +156,11 @@ async def discover_futures(ib: IB, instrument_cfg: dict) -> list:
         preferred_tc = futures_trading_class
     else:
         from collections import Counter
-        tc_counts = Counter(cd.contract.tradingClass for cd in cds)
+        tc_counts    = Counter(cd.contract.tradingClass for cd in cds)
         preferred_tc = tc_counts.most_common(1)[0][0]
 
     print(f"[IB] {sym} futures: using tradingClass='{preferred_tc}' "
-          f"({sum(1 for cd in cds if cd.contract.tradingClass == preferred_tc)} contracts), "
-          f"depth={depth}")
+          f"({sum(1 for cd in cds if cd.contract.tradingClass == preferred_tc)} contracts)")
 
     qualifying = []
     for cd in cds:
@@ -182,15 +178,17 @@ async def discover_futures(ib: IB, instrument_cfg: dict) -> list:
             (cd.contract for cd in cds if cd.contract.tradingClass == preferred_tc),
             key=lambda c: c.lastTradeDateOrContractMonth,
         )
-        qualifying = all_tc[:depth]
+        qualifying = all_tc[:2]
         print(f"[IB][WARN] No {sym} futures within 62d for class "
               f"'{preferred_tc}'; using nearest {len(qualifying)}.")
-    else:
+
+    depth = getattr(cfg, 'FUT_CHAIN_DEPTH', 2)
+    if len(qualifying) > depth:
         qualifying = qualifying[:depth]
 
     print(f"[IB] {sym}: qualifying {len(qualifying)} futures contracts...")
     try:
-        qualified = await ib.qualifyContractsAsync(*qualifying)
+        qualified  = await ib.qualifyContractsAsync(*qualifying)
         qualifying = [c for c in qualified if getattr(c, 'conId', 0) > 0]
         print(f"[IB] {sym}: futures qualified: "
               f"{[c.localSymbol for c in qualifying]}")
@@ -297,29 +295,24 @@ async def _qualify_contracts_batched(ib: IB, contracts: list,
 
     print(f"[IB] {label}: qualify complete — "
           f"{len(qualified)} valid, {n_unqualified} invalid combos, "
-          f"{n_timeouts} batch timeouts, "
-          f"{total - len(qualified) - n_unqualified - n_timeouts*_QUALIFY_BATCH_SIZE} other")
+          f"{n_timeouts} batch timeouts")
     return qualified
 
-
-# ── FOP chain discovery ───────────────────────────────────────────────────────
 
 async def discover_fop_chain(ib: IB, instrument_cfg: dict,
                               details_cache: dict,
                               futures: list | None = None) -> list:
-    """Discover FOP option chain. Includes canonical-underConId fallback for SI/COMEX."""
     sym       = instrument_cfg['symbol']
     exch      = instrument_cfg['exchange']
     curr      = instrument_cfg['currency']
     preferred = instrument_cfg.get('preferred_trading_classes', None)
-    depth     = getattr(cfg, 'FUT_CHAIN_DEPTH', 3)
     now       = datetime.now(timezone.utc)
 
     if futures:
         fut_list = sorted(futures,
-                           key=lambda c: c.lastTradeDateOrContractMonth)[:depth]
-        print(f"[IB] {sym}: using {len(fut_list)} pre-fetched futures "
-              f"(depth={depth}): {[f.localSymbol for f in fut_list]}")
+                           key=lambda c: c.lastTradeDateOrContractMonth)
+        print(f"[IB] {sym}: using {len(fut_list)} pre-fetched futures: "
+              f"{[f.localSymbol for f in fut_list]}")
     else:
         print(f"[IB] {sym}: fetching futures list...")
         fut_cds = await req_contract_details(
@@ -332,16 +325,10 @@ async def discover_fop_chain(ib: IB, instrument_cfg: dict,
         fut_list = sorted(
             (cd.contract for cd in fut_cds),
             key=lambda c: c.lastTradeDateOrContractMonth
-        )[:depth]
-        print(f"[IB] {sym}: using front {len(fut_list)} futures: "
-              f"{[f.localSymbol for f in fut_list]}")
+        )
 
-    if not fut_list:
-        print(f"[IB][WARN] {sym}: no futures in range.")
-        return []
-
-    all_chains     : list = []
-    seen_chain_keys: set  = set()
+    all_chains      : list = []
+    seen_chain_keys : set  = set()
 
     for fut in fut_list:
         print(f"[IB] {sym}: reqSecDefOptParams for {fut.localSymbol} "
@@ -360,166 +347,86 @@ async def discover_fop_chain(ib: IB, instrument_cfg: dict,
               f"(total unique: {len(all_chains)})")
         await asyncio.sleep(0.3)
 
-    # ── Canonical underConId fallback (SI/COMEX) ──────────────────────────────
     if not all_chains:
         print(f"[IB] {sym}: reqSecDefOptParams found nothing via dated futures conIds.")
-        print(f"[IB] {sym}: trying canonical underlying conId via generic FUT qualify...")
-
-        generic_fut          = Contract()
-        generic_fut.symbol   = sym
-        generic_fut.secType  = 'FUT'
-        generic_fut.exchange = exch
-        generic_fut.currency = curr
-        try:
-            qualified_futs = await ib.qualifyContractsAsync(generic_fut)
-            canonical_ids = sorted(set(
-                c.conId for c in (qualified_futs or [])
-                if getattr(c, 'conId', 0) > 0
-            ))
-        except Exception as e:
-            print(f"[IB][WARN] {sym}: generic FUT qualify failed: {e}")
-            canonical_ids = []
-
-        if not canonical_ids:
-            print(f"[IB] {sym}: falling back to reqContractDetails FOP probe...")
-            generic_fop          = Contract()
-            generic_fop.symbol   = sym
-            generic_fop.secType  = 'FOP'
-            generic_fop.exchange = exch
-            generic_fop.currency = curr
-            sample_cds = await req_contract_details(
-                ib, generic_fop,
-                label=f"{sym} FOP underConId probe",
-                timeout=30.0,
-            )
-            canonical_ids = sorted(set(
-                cd.underConId for cd in (sample_cds or [])
-                if getattr(cd, 'underConId', 0) > 0
-            ))
-
-        if canonical_ids:
-            print(f"[IB] {sym}: retrying reqSecDefOptParams with canonical "
-                  f"underConIds: {canonical_ids[:5]}...")
-            for under_id in canonical_ids[:5]:
-                chains_for_id = await _req_sec_def_opt_params(
-                    ib, sym, exch, 'FUT', under_id
-                )
-                for chain in chains_for_id:
-                    key = (chain.tradingClass, frozenset(chain.expirations))
-                    if key not in seen_chain_keys:
-                        seen_chain_keys.add(key)
-                        all_chains.append(chain)
-                if all_chains:
-                    print(f"[IB] {sym}: fallback succeeded with "
-                          f"underConId={under_id} — "
-                          f"{len(all_chains)} chains found")
-                    break
-                await asyncio.sleep(0.3)
-        else:
-            print(f"[IB][WARN] {sym}: could not determine canonical underConId.")
-
-    if not all_chains:
-        print(f"[IB][WARN] {sym}: reqSecDefOptParams returned no chains.")
         return []
 
-    from collections import defaultdict
-    tc_exp: dict = defaultdict(set)
-    tc_str: dict = defaultdict(set)
-    for c in all_chains:
-        tc_exp[c.tradingClass].update(c.expirations)
-        tc_str[c.tradingClass].update(c.strikes)
-    tc_summary = {tc: len(tc_exp[tc]) * len(tc_str[tc]) * 2 for tc in tc_exp}
-    print(f"[IB] {sym} chains (pre-filter): "
-          f"{dict(sorted(tc_summary.items(), key=lambda x: -x[1]))}")
+    if preferred:
+        primary = [c for c in all_chains if c.tradingClass in preferred]
+        if not primary:
+            print(f"[IB][WARN] {sym}: none of preferred classes {preferred} found; "
+                  f"using all {len(all_chains)} chains.")
+            primary = all_chains
+    else:
+        primary = all_chains
 
-    if preferred is not None:
-        all_chains = [c for c in all_chains if c.tradingClass in preferred]
-        print(f"[IB] {sym}: {len(all_chains)} chains after "
-              f"preferred_trading_classes={preferred} filter")
-
-    if not all_chains:
-        print(f"[IB][WARN] {sym}: no chains after filter.")
-        return []
-
-    chain_specs: list[ChainSpec] = []
-
-    for chain in all_chains:
-        valid_expiries = set()
-        for expiry in chain.expirations:
-            exp_dt = parse_expiry_date(expiry)
-            if exp_dt is not None and exp_dt < now:
+    chain_specs : list[ChainSpec] = []
+    for fut in fut_list:
+        for chain in primary:
+            valid_expiries = set()
+            for expiry in chain.expirations:
+                exp_dt = parse_expiry_date(expiry)
+                if exp_dt is not None and exp_dt < now:
+                    continue
+                valid_expiries.add(expiry)
+            if not valid_expiries:
                 continue
-            valid_expiries.add(expiry)
+            chain_specs.append(ChainSpec(
+                symbol        = sym,
+                sec_type      = 'FOP',
+                exchange      = exch,
+                currency      = curr,
+                trading_class = chain.tradingClass,
+                multiplier    = chain.multiplier,
+                expirations   = valid_expiries,
+                strikes       = set(chain.strikes),
+                und_con_id    = fut.conId,
+                und_symbol    = sym,
+            ))
 
-        if not valid_expiries:
-            continue
+    # Deduplicate chain specs by (tradingClass, expirations)
+    seen : set = set()
+    deduped : list[ChainSpec] = []
+    for cs in chain_specs:
+        key = (cs.trading_class, frozenset(cs.expirations))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(cs)
 
-        chain_specs.append(ChainSpec(
-            symbol        = sym,
-            sec_type      = 'FOP',
-            exchange      = exch,
-            currency      = curr,
-            trading_class = chain.tradingClass,
-            multiplier    = chain.multiplier,
-            expirations   = valid_expiries,
-            strikes       = set(chain.strikes),
-            und_con_id    = fut_list[0].conId,
-            und_symbol    = fut_list[0].localSymbol,
-        ))
+    total_combos = sum(len(s.expirations) * len(s.strikes) * 2 for s in deduped)
+    print(f"[IB] {sym} FOP: {len(deduped)} chain specs cached "
+          f"({total_combos} theoretical contracts, qualify at scan time)")
+    return deduped
 
-    total_combos = sum(
-        len(s.expirations) * len(s.strikes) * 2 for s in chain_specs
-    )
-    print(f"[IB] {sym} FOP: {len(chain_specs)} chain specs cached "
-          f"({total_combos} theoretical contracts)")
-    return chain_specs
-
-
-# ── Equity option chain discovery ────────────────────────────────────────────
 
 async def discover_equity_options(ib: IB, instrument_cfg: dict,
                                    details_cache: dict) -> tuple[list, list]:
-    sym  = instrument_cfg['symbol']
-    exch = instrument_cfg.get('exchange', 'SMART')
-    curr = instrument_cfg['currency']
-    now  = datetime.now(timezone.utc)
+    sym      = instrument_cfg['symbol']
+    exch     = instrument_cfg.get('exchange', 'SMART')
+    curr     = instrument_cfg['currency']
+    now      = datetime.now(timezone.utc)
 
-    stk          = Contract()
-    stk.symbol   = sym
-    stk.secType  = 'STK'
-    stk.exchange = exch
-    stk.currency = curr
+    stk         = Contract()
+    stk.symbol  = sym
+    stk.secType = 'STK'
+    stk.exchange= exch
+    stk.currency= curr
 
-    stk_cds = await req_contract_details(ib, stk, label=f"{sym} STK", timeout=60.0)
-    if not stk_cds:
-        print(f"[IB][WARN] {sym}: STK not found.")
+    cds = await req_contract_details(ib, stk, label=f"{sym} STK")
+    if not cds:
+        print(f"[IB][WARN] {sym}: no STK contract found.")
         return [], []
 
-    underlying = [stk_cds[0].contract]
-    und_con_id = underlying[0].conId
-    print(f"[IB] {sym}: STK conId={und_con_id}")
+    und_contract = cds[0].contract
+    und_con_id   = und_contract.conId
 
-    print(f"[IB] {sym}: reqSecDefOptParams...")
     chains = await _req_sec_def_opt_params(ib, sym, '', 'STK', und_con_id)
     if not chains:
-        print(f"[IB][WARN] {sym}: no chains returned.")
-        return underlying, []
+        print(f"[IB][WARN] {sym}: no OPT chains from reqSecDefOptParams.")
+        return [und_contract], []
 
-    from collections import defaultdict
-    chain_info = {f"{c.exchange}/{c.tradingClass}":
-                  len(c.expirations)*len(c.strikes)*2 for c in chains}
-    print(f"[IB] {sym} OPT chains: "
-          f"{dict(sorted(chain_info.items(), key=lambda x: -x[1]))}")
-
-    primary = [c for c in chains
-               if c.exchange == 'SMART' and c.tradingClass == sym]
-    if not primary:
-        primary = [c for c in chains if c.exchange == 'SMART']
-    if not primary:
-        primary = chains
-
-    chain_specs: list[ChainSpec] = []
-    for chain in primary:
+    chain_specs : list[ChainSpec] = []
+    for chain in chains:
         valid_expiries = set()
         for expiry in chain.expirations:
             exp_dt = parse_expiry_date(expiry)
@@ -541,10 +448,13 @@ async def discover_equity_options(ib: IB, instrument_cfg: dict,
             und_symbol    = sym,
         ))
 
-    total_combos = sum(len(s.expirations)*len(s.strikes)*2 for s in chain_specs)
+    total_combos = sum(
+        len(s.expirations) * len(s.strikes) * 2 for s in chain_specs
+    )
     print(f"[IB] {sym} OPT: {len(chain_specs)} chain specs cached "
-          f"({total_combos} theoretical contracts)")
-    return underlying, chain_specs
+          f"({total_combos} theoretical contracts across all non-expired expiries, "
+          f"qualify at scan time on ±20% subset)")
+    return [und_contract], chain_specs
 
 
 # ── Scan-time contract qualification ─────────────────────────────────────────
@@ -554,98 +464,82 @@ async def qualify_chain_for_scan(ib: IB,
                                   underlying_price: float | None,
                                   moneyness_band: float,
                                   details_cache: dict) -> list:
-    """
-    Qualify options within the moneyness band.
-    Contracts already in details_cache are reused — no IB round-trip.
-    Only new contracts in the band are sent to qualifyContractsAsync.
-    """
-    from ib_insync import Contract as IBContract
-    from types import SimpleNamespace
+    sym = chain_specs[0].symbol if chain_specs else '?'
 
-    _existing_key_to_conid: dict[tuple, int] = {
-        (cd.contract.symbol,
-         cd.contract.lastTradeDateOrContractMonth,
-         cd.contract.strike,
-         cd.contract.right): conid
-        for conid, cd in details_cache.items()
-        if hasattr(cd, 'contract')
-    }
+    # Build lookup of already-qualified contracts from details_cache
+    existing_key_lookup: dict[tuple, int] = {}
+    for conid, cd in details_cache.items():
+        if not hasattr(cd, 'contract'):
+            continue
+        c   = cd.contract
+        key = (c.symbol, c.lastTradeDateOrContractMonth,
+               float(c.strike), c.right)
+        existing_key_lookup[key] = conid
 
-    raw: list               = []
-    already_qualified: list = []
-    n_skipped_invalid       = 0
-    n_cache_hits            = 0
-
-    if underlying_price and underlying_price > 0:
-        lo = underlying_price * (1 - moneyness_band)
-        hi = underlying_price * (1 + moneyness_band)
-    else:
-        lo, hi = 0.0, float('inf')
-
-    now = datetime.now(timezone.utc)
+    already_qualified : list = []
+    raw               : list = []
+    und_con_ids       : dict = {}   # id(contract) -> underConId
 
     for spec in chain_specs:
-        for expiry in sorted(spec.expirations):
+        for expiry in spec.expirations:
             exp_dt = parse_expiry_date(expiry)
-            if exp_dt is None or exp_dt < now:
+            if exp_dt is not None and exp_dt < datetime.now(timezone.utc):
                 continue
-            for strike in sorted(spec.strikes):
-                if not (lo <= strike <= hi):
-                    continue
+            for strike in spec.strikes:
+                if underlying_price and underlying_price > 0:
+                    lo = underlying_price * (1 - moneyness_band)
+                    hi = underlying_price * (1 + moneyness_band)
+                    if not (lo <= strike <= hi):
+                        continue
                 for right in ('C', 'P'):
-                    cache_key = (spec.symbol, expiry, strike, right)
+                    key = (spec.symbol, expiry, float(strike), right)
 
+                    # Cache hit — skip re-qualification
+                    if key in existing_key_lookup:
+                        conid = existing_key_lookup[key]
+                        cd    = details_cache[conid]
+                        already_qualified.append(cd.contract)
+                        continue
+
+                    # Skip known-invalid combos
                     if _is_invalid_cached(spec.symbol, expiry, strike, right):
-                        n_skipped_invalid += 1
                         continue
 
-                    existing_conid = _existing_key_to_conid.get(cache_key)
-                    if existing_conid is not None:
-                        already_qualified.append(details_cache[existing_conid].contract)
-                        n_cache_hits += 1
-                        continue
-
-                    ct = IBContract()
-                    ct.symbol        = spec.symbol
-                    ct.secType       = spec.sec_type
-                    ct.exchange      = spec.exchange
-                    ct.currency      = spec.currency
-                    ct.lastTradeDateOrContractMonth = expiry
-                    ct.strike        = strike
-                    ct.right         = right
-                    ct.multiplier    = spec.multiplier
-                    ct.tradingClass  = spec.trading_class
-                    raw.append((ct, spec.und_con_id))
-
-    und_price_str = f"{underlying_price:.4g}" if underlying_price else 'N/A'
-    print(f"[IB] qualify_chain_for_scan: {len(raw)} to qualify, "
-          f"{n_cache_hits} reused, {n_skipped_invalid} invalid "
-          f"(±{moneyness_band*100:.0f}% of {und_price_str})")
+                    c                              = Contract()
+                    c.symbol                       = spec.symbol
+                    c.secType                      = spec.sec_type
+                    c.exchange                     = spec.exchange
+                    c.currency                     = spec.currency
+                    c.tradingClass                 = spec.trading_class
+                    c.multiplier                   = spec.multiplier
+                    c.lastTradeDateOrContractMonth = expiry
+                    c.strike                       = strike
+                    c.right                        = right
+                    raw.append(c)
+                    und_con_ids[id(c)]             = spec.und_con_id
 
     if not raw:
+        print(f"[IB] {sym}: all {len(already_qualified)} in-band contracts "
+              f"already cached — skipping qualification.")
         return already_qualified
 
-    contracts   = [ct for ct, _ in raw]
-    und_con_ids = {id(ct): uid for ct, uid in raw}
+    print(f"[IB] {sym}: qualify_chain_for_scan — "
+          f"{len(already_qualified)} cache hits, {len(raw)} new to qualify")
 
-    contract_keys: dict[int, tuple] = {
-        id(ct): (ct.symbol,
-                 ct.lastTradeDateOrContractMonth,
-                 ct.strike,
-                 ct.right)
-        for ct in contracts
-    }
-
-    qualified = await _qualify_contracts_batched(ib, contracts, label='scan')
-
-    qualified_ids = {ct.conId for ct in qualified if getattr(ct, 'conId', 0) > 0}
+    qualified     = await _qualify_contracts_batched(ib, raw, label=sym)
     n_newly_cached = 0
-    for ct in contracts:
-        if getattr(ct, 'conId', 0) not in qualified_ids:
-            key = contract_keys.get(id(ct))
-            if key:
-                _mark_invalid(*key)
-                n_newly_cached += 1
+
+    # Mark failed combos as invalid
+    qualified_keys = {
+        (c.symbol, c.lastTradeDateOrContractMonth, float(c.strike), c.right)
+        for c in qualified
+    }
+    for c in raw:
+        key = (c.symbol, c.lastTradeDateOrContractMonth, float(c.strike), c.right)
+        if key not in qualified_keys:
+            _mark_invalid(c.symbol, c.lastTradeDateOrContractMonth,
+                          float(c.strike), c.right)
+            n_newly_cached += 1
 
     if n_newly_cached:
         ttl = getattr(cfg, 'QUALIFY_ERROR_TTL_SEC', 3600)
@@ -777,7 +671,7 @@ class EquityStream:
             while time.time() < deadline:
                 if self.price() is not None:
                     break
-                await asyncio.sleep(0.3)
+                await self._ib.sleep(0.3)
             p = self.price()
             print(f"[IB] Equity stream started for {sym}: "
                   f"{'price=' + str(round(p,2)) if p else 'no price yet'}")
@@ -857,7 +751,14 @@ class TickStream:
 class OIStream:
     """
     Persistent non-snapshot stream for a FOP underlying future.
-    genericTickList='588' → Futures Open Interest (tick 86).
+
+    genericTickList='588,233':
+      '588' → Futures Open Interest (tick 86), read via futuresOpenInterest.
+      '233' → RTVolume, ensures bid/ask/last are delivered promptly.
+               Without '233', default bid/ask ticks may arrive after the
+               5-second wait loop exits, leaving FuturesTickStream with
+               no quote to classify against → high unclassified rate.
+
     Also delivers price ticks (bid/ask/last/close) via price().
     """
 
@@ -871,15 +772,19 @@ class OIStream:
         try:
             self._ticker = self._ib.reqMktData(
                 self._contract,
-                genericTickList='588',
+                genericTickList='588,233',
                 snapshot=False,
                 regulatorySnapshot=False,
             )
+            # Wait until both OI and a valid price (bid/ask) have arrived.
+            # Previously only waited for oi() — bid/ask could still be nan
+            # when the loop exited, so FuturesTickStream snapshotted nan
+            # bid/ask for every tick and classified nothing.
             deadline = time.time() + 5.0
             while time.time() < deadline:
-                if self.oi() is not None:
+                if self.oi() is not None and self.price() is not None:
                     break
-                await asyncio.sleep(0.3)
+                await self._ib.sleep(0.3)
             oi_val = self.oi()
             print(f"[IB] OI stream started for {sym} "
                   f"(conId={self._contract.conId}): "

@@ -306,9 +306,10 @@ class InstrumentScanner:
                 underlying_price_map['equity'] = float(equity_price)
             else:
                 underlying_price_map['equity'] = None
-                print(f"[{self.key}] Could not resolve underlying price")
+                print(f"[{self.key}] Could not resolve underlying price "
+                      f"— moneyness filter will pass all strikes through")
 
-        # ── 5. Build raw DataFrame ────────────────────────────────────────
+        # ── 5. Build raw DataFrame ─────────────────────────────────────────
         rows = []
         for opt in contracts_to_quote:
             t  = opt_tickers.get(opt.conId)
@@ -543,27 +544,56 @@ class InstrumentScanner:
 
         # Apply near-expiry filter from config.
         # DISPLAY_NEAR_EXPIRY_DAYS=0 means disabled (show all expiries).
-        # Fallback: if the filter leaves nothing, show the nearest available
-        # expiry so the table is never blank.
-        near_days = getattr(cfg, 'DISPLAY_NEAR_EXPIRY_DAYS', 2)
+        # Fallback: if the filter leaves nothing displayable, show the nearest
+        # available expiry that has data — but determine whether ANY expiry
+        # exists within the window by checking the FULL df (not display_df),
+        # so that today's expiry with no quotes is still recognised as in-window
+        # and the label is accurate.
+        near_days    = getattr(cfg, 'DISPLAY_NEAR_EXPIRY_DAYS', 2)
         expiry_label = 'all expiries'
 
-        if near_days > 0 and 'expiry' in display_df.columns:
-            today_str   = now.strftime('%Y%m%d')
-            cutoff_str  = (now + timedelta(days=near_days)).strftime('%Y%m%d')
-            near_mask   = (display_df['expiry'] >= today_str) & \
-                          (display_df['expiry'] <= cutoff_str)
-            near_df     = display_df[near_mask]
+        if near_days > 0 and 'expiry' in df.columns:
+            today_str  = now.strftime('%Y%m%d')
+            cutoff_str = (now + timedelta(days=near_days)).strftime('%Y%m%d')
+
+            # Check full df (including no-data rows) for expiries in window
+            all_expiries_in_window = sorted(
+                e for e in df['expiry'].dropna().unique()
+                if today_str <= e <= cutoff_str
+            )
+
+            # Apply the filter to display_df (rows that have actual quote data)
+            near_mask = (
+                display_df['expiry'].notna() &
+                (display_df['expiry'] >= today_str) &
+                (display_df['expiry'] <= cutoff_str)
+            )
+            near_df = display_df[near_mask]
 
             if not near_df.empty:
                 display_df   = near_df
                 expiry_label = (f"expiries within {near_days}d "
                                 f"(≤{cutoff_str})")
+            elif all_expiries_in_window:
+                # Expiries exist in-window but none have displayable data
+                # (e.g. today's expiry has no quotes). Show nearest with data
+                # but label correctly — don't claim there's nothing within 2d.
+                available_with_data = sorted(display_df['expiry'].dropna().unique())
+                if available_with_data:
+                    nearest      = available_with_data[0]
+                    display_df   = display_df[display_df['expiry'] == nearest]
+                    expiry_label = (
+                        f"nearest expiry ({nearest}) — "
+                        f"no data for in-window expir{'y' if len(all_expiries_in_window) == 1 else 'ies'} "
+                        f"({', '.join(all_expiries_in_window)})"
+                    )
+                else:
+                    expiry_label = f"expiries within {near_days}d (≤{cutoff_str})"
             else:
-                # Nothing in the window — fall back to nearest available expiry
+                # Nothing in window at all — fall back to nearest available expiry
                 available_expiries = sorted(display_df['expiry'].dropna().unique())
                 if available_expiries:
-                    nearest  = available_expiries[0]
+                    nearest      = available_expiries[0]
                     display_df   = display_df[display_df['expiry'] == nearest]
                     expiry_label = f"nearest expiry ({nearest}) — none within {near_days}d"
 
@@ -577,8 +607,45 @@ class InstrumentScanner:
         # ── Fingerprint findings ──────────────────────────────────────────
         if fp_findings:
             print(f"\n  Fingerprint findings ({len(fp_findings)}):")
+
+            # Build a fast lookup: (expiry, strike_str, right) -> (localSymbol, volume)
+            # Used to print per-trade detail under directional volume_cluster findings.
+            _trade_lookup: dict[tuple, tuple] = {}
+            if 'expiry' in df.columns and 'strike' in df.columns:
+                for _, _row in df.iterrows():
+                    _expiry = str(_row.get('expiry', ''))
+                    _strike = str(_row.get('strike', ''))
+                    _right  = str(_row.get('right', ''))
+                    _sym    = str(_row.get('localSymbol', ''))
+                    _vol    = _row.get('volume')
+                    if _expiry and _strike and _right:
+                        _trade_lookup[(_expiry, _strike, _right)] = (_sym, _vol)
+
             for fp in fp_findings[:5]:
                 print(f"    [{fp.model}][{fp.confidence:.2f}] {fp.note}")
+
+                # For directional volume_cluster findings, print the individual
+                # strikes so the reader can see exactly which trades make up the
+                # cluster without needing to cross-reference the full table.
+                # "Directional" means n_rights == 1 (calls-only or puts-only).
+                ev = fp.evidence or {}
+                if (fp.finding_type == 'volume_cluster'
+                        and ev.get('direction_count', 2) == 1
+                        and ev.get('keys')):
+                    for raw_key in ev['keys']:
+                        parts = raw_key.split('|')
+                        if len(parts) != 3:
+                            continue
+                        expiry, strike, right = parts
+                        lookup_hit = _trade_lookup.get((expiry, strike, str(right)))
+                        if lookup_hit:
+                            sym, vol = lookup_hit
+                            vol_str  = f"{vol:.0f}" if vol is not None else '?'
+                            print(f"        {sym or expiry+' '+right:>16s}  "
+                                  f"strike={float(strike):>8.2f}  "
+                                  f"vol={vol_str:>6s}")
+                        else:
+                            print(f"        {expiry} {right} K={strike}")
 
         # ── Alerts ────────────────────────────────────────────────────────
         if alerts:
