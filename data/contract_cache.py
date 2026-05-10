@@ -245,14 +245,15 @@ def archive_contracts(instrument: str, contracts_dicts: list[dict]) -> None:
         except Exception as e:
             print(f"[CACHE][WARN] Could not load archive for {instrument}: {e}")
 
-    now_str = datetime.now(timezone.utc).isoformat()
+    now_str  = datetime.now(timezone.utc).isoformat()
+    today    = datetime.now(timezone.utc).date()
     for c in contracts_dicts:
         cid = c['conId']
         if cid in existing:
             existing[cid]['last_seen'] = now_str
-            # Mark expired if expiry date is in the past
+            # Mark expired only if expiry date is strictly before today
             exp_dt = parse_expiry_date(c.get('expiry', ''))
-            if exp_dt and exp_dt < datetime.now(timezone.utc):
+            if exp_dt and exp_dt.date() < today:
                 existing[cid].setdefault('expired_at', now_str)
         else:
             entry = dict(c)
@@ -279,12 +280,12 @@ def prune_expired_specs(chain_specs: list) -> tuple[list, list]:
     in-the-money later, and re-qualification would require another IB round-trip.
     Moneyness filtering happens at scan time in qualify_chain_for_scan(), not here.
     """
-    now = datetime.now(timezone.utc)
+    today  = datetime.now(timezone.utc).date()
     active, expired = [], []
     for spec in chain_specs:
-        # Keep if any expiry is still in the future (not yet expired)
+        # Keep if any expiry date is today or later
         has_active = any(
-            (dt := parse_expiry_date(e)) is not None and dt >= now
+            (dt := parse_expiry_date(e)) is not None and dt.date() >= today
             for e in spec.expirations
         )
         if has_active:

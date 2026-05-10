@@ -92,6 +92,119 @@ def _mark_invalid(sym: str, expiry: str, strike: float, right: str) -> None:
     _invalid_contract_cache[(sym, expiry, strike, right)] = time.time() + ttl
 
 
+# ── Qualified contract cache (details_cache persistence) ────────────────────
+#
+# The details_cache on InstrumentScanner (conId -> SimpleNamespace with .contract
+# and .underConId) is rebuilt from scratch each process start via 4000+ IB calls
+# taking ~110s.  These functions persist it to disk so subsequent starts load in
+# milliseconds.  Stored separately from the ChainSpec cache so version bumps
+# on one don't invalidate the other.
+
+_QUALIFIED_VERSION = '1.0'
+
+
+def _qual_cache_path(instrument: str) -> 'Path':
+    from pathlib import Path
+    return Path(getattr(cfg, 'CACHE_DIR', './cache')) / f'qualified_{instrument}.json'
+
+
+def save_qualified_cache(instrument: str, details_cache: dict) -> None:
+    """
+    Persist details_cache to disk.
+    Only stores non-expired contracts; expired ones are silently dropped.
+    """
+    from pathlib import Path
+    import json as _json
+    if not details_cache:
+        return
+    now = datetime.now(timezone.utc)
+    rows = []
+    for conid, cd in details_cache.items():
+        c = getattr(cd, 'contract', None)
+        if c is None:
+            continue
+        expiry_str = getattr(c, 'lastTradeDateOrContractMonth', '') or ''
+        exp_dt = parse_expiry_date(expiry_str)
+        if exp_dt is not None and exp_dt.date() < now.date():
+            continue  # drop expired
+        rows.append({
+            'conId'          : getattr(c, 'conId',                          conid),
+            'symbol'         : getattr(c, 'symbol',                         ''),
+            'localSymbol'    : getattr(c, 'localSymbol',                    ''),
+            'secType'        : getattr(c, 'secType',                        ''),
+            'exchange'       : getattr(c, 'exchange',                       ''),
+            'currency'       : getattr(c, 'currency',                       ''),
+            'strike'         : getattr(c, 'strike',                         0.0),
+            'right'          : getattr(c, 'right',                          ''),
+            'expiry'         : expiry_str,
+            'multiplier'     : getattr(c, 'multiplier',                     ''),
+            'tradingClass'   : getattr(c, 'tradingClass',                   ''),
+            'underConId'     : getattr(cd, 'underConId',                    0),
+        })
+    data = {
+        'version'    : _QUALIFIED_VERSION,
+        'instrument' : instrument,
+        'saved_at'   : now.isoformat(),
+        'contracts'  : rows,
+    }
+    try:
+        path = _qual_cache_path(instrument)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_json.dumps(data, indent=2))
+        print(f"[QCACHE] {instrument}: saved {len(rows)} qualified contracts to disk.")
+    except Exception as e:
+        print(f"[QCACHE][WARN] {instrument}: could not save qualified cache: {e}")
+
+
+def load_qualified_cache(instrument: str) -> dict:
+    """
+    Load a previously saved details_cache from disk.
+    Returns {} if missing, wrong version, or all entries expired.
+    """
+    import json as _json
+    from types import SimpleNamespace as _SN
+    path = _qual_cache_path(instrument)
+    if not path.exists():
+        return {}
+    try:
+        data = _json.loads(path.read_text())
+    except Exception as e:
+        print(f"[QCACHE][WARN] {instrument}: could not read qualified cache: {e}")
+        return {}
+    if data.get('version') != _QUALIFIED_VERSION:
+        print(f"[QCACHE] {instrument}: version mismatch — will re-qualify.")
+        return {}
+    now    = datetime.now(timezone.utc)
+    result : dict = {}
+    n_expired = 0
+    for row in data.get('contracts', []):
+        expiry_str = row.get('expiry', '')
+        exp_dt     = parse_expiry_date(expiry_str)
+        if exp_dt is not None and exp_dt.date() < now.date():
+            n_expired += 1
+            continue
+        from ib_insync import Contract
+        c                                    = Contract()
+        c.conId                              = row['conId']
+        c.symbol                             = row.get('symbol', '')
+        c.localSymbol                        = row.get('localSymbol', '')
+        c.secType                            = row.get('secType', '')
+        c.exchange                           = row.get('exchange', '')
+        c.currency                           = row.get('currency', '')
+        c.strike                             = float(row.get('strike', 0))
+        c.right                              = row.get('right', '')
+        c.lastTradeDateOrContractMonth       = expiry_str
+        c.multiplier                         = row.get('multiplier', '')
+        c.tradingClass                       = row.get('tradingClass', '')
+        cd                                   = _SN()
+        cd.contract                          = c
+        cd.underConId                        = row.get('underConId', 0)
+        result[c.conId]                      = cd
+    print(f"[QCACHE] {instrument}: loaded {len(result)} qualified contracts "
+          f"({n_expired} expired dropped).")
+    return result
+
+
 # ── Connection ────────────────────────────────────────────────────────────────
 
 def connect(ib: IB) -> bool:
@@ -168,7 +281,7 @@ async def discover_futures(ib: IB, instrument_cfg: dict) -> list:
         if c.tradingClass != preferred_tc:
             continue
         exp_dt = parse_expiry_date(c.lastTradeDateOrContractMonth)
-        if exp_dt is not None and now < exp_dt <= cutoff:
+        if exp_dt is not None and exp_dt.date() >= now.date() and exp_dt <= cutoff:
             qualifying.append(c)
 
     qualifying = sorted(qualifying, key=lambda c: c.lastTradeDateOrContractMonth)
@@ -366,7 +479,7 @@ async def discover_fop_chain(ib: IB, instrument_cfg: dict,
             valid_expiries = set()
             for expiry in chain.expirations:
                 exp_dt = parse_expiry_date(expiry)
-                if exp_dt is not None and exp_dt < now:
+                if exp_dt is not None and exp_dt.date() < now.date():
                     continue
                 valid_expiries.add(expiry)
             if not valid_expiries:
@@ -430,7 +543,7 @@ async def discover_equity_options(ib: IB, instrument_cfg: dict,
         valid_expiries = set()
         for expiry in chain.expirations:
             exp_dt = parse_expiry_date(expiry)
-            if exp_dt is not None and exp_dt < now:
+            if exp_dt is not None and exp_dt.date() < now.date():
                 continue
             valid_expiries.add(expiry)
         if not valid_expiries:
@@ -483,7 +596,7 @@ async def qualify_chain_for_scan(ib: IB,
     for spec in chain_specs:
         for expiry in spec.expirations:
             exp_dt = parse_expiry_date(expiry)
-            if exp_dt is not None and exp_dt < datetime.now(timezone.utc):
+            if exp_dt is not None and exp_dt.date() < datetime.now(timezone.utc).date():
                 continue
             for strike in spec.strikes:
                 if underlying_price and underlying_price > 0:

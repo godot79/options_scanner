@@ -26,6 +26,7 @@ from options_scanner.data import (
 from options_scanner.data.ib_client import (
     EquityStream, OIStream, FuturesTickStream, FuturesMomentum,
     qualify_chain_for_scan,
+    save_qualified_cache, load_qualified_cache,
 )
 from options_scanner.models import compute as model_compute
 from options_scanner.signals.volume_history import VolumeHistory
@@ -73,6 +74,8 @@ class InstrumentScanner:
         self._oi_streams           : dict[int, OIStream]           = {}
         self._futures_tick_streams : dict[int, FuturesTickStream]  = {}
         self._chain_specs          : list                          = []
+        self._bg_qualify_task      : 'asyncio.Task | None'         = None
+        self._bg_qualify_done      : bool                          = False
 
     # ── Discovery ─────────────────────────────────────────────────────────────
 
@@ -93,6 +96,14 @@ class InstrumentScanner:
             f"{len(self.option_contracts)} options."
         )
 
+        # Load qualified contracts from disk so the first scan doesn't block
+        # on 100+ seconds of IB qualification.
+        loaded = load_qualified_cache(self.key)
+        if loaded:
+            self.details_cache.update(loaded)
+            print(f"[{self.key}] Qualified cache loaded: "
+                  f"{len(self.details_cache)} contracts ready for scan.")
+
         if self.cfg['secType'] == 'OPT':
             self._equity_stream = EquityStream(self.ib, self.cfg)
             await self._equity_stream.start()
@@ -102,6 +113,14 @@ class InstrumentScanner:
 
         if cfg.USE_STREAMING_TICKS:
             self._start_tick_streams()
+
+        # Start background qualification task so details_cache fills up
+        # without blocking the scan loop.
+        if self._chain_specs:
+            self._bg_qualify_task = asyncio.create_task(
+                self._background_qualify(),
+                name=f'bg_qualify_{self.key}',
+            )
 
     def _load_from_cache(self) -> None:
         self._chain_specs         = self.cache_manager.serve_chain_specs(self.key)
@@ -114,6 +133,65 @@ class InstrumentScanner:
               f"{len(self._chain_specs)} chain specs "
               f"({total} theoretical contracts), "
               f"{len(self.underlying_contracts)} underlying futures")
+
+    # ── Background qualification ──────────────────────────────────────────────
+
+    async def _background_qualify(self) -> None:
+        """
+        Qualify all in-band contracts in the background so the scan loop
+        is never blocked waiting for IB.
+
+        How it works:
+          1. Runs qualify_chain_for_scan once using the current underlying
+             price (from OI stream) and the full MONEYNESS_BAND.
+          2. Merges results into self.details_cache (which may already have
+             entries loaded from disk).
+          3. Saves the updated details_cache to disk so the next process
+             start can skip qualification entirely.
+          4. Repeats once per SCAN_INTERVAL_SEC so new expiries / strikes
+             that come in-band as the underlying moves are caught.
+
+        The scan loop checks self._bg_qualify_done to know whether the
+        full chain has been qualified at least once.  On first startup with
+        a warm disk cache the scan loop runs immediately from the loaded
+        cache; this task fills any gaps in the background.
+        """
+        while True:
+            try:
+                und_price: float | None = None
+                for oi_stream in self._oi_streams.values():
+                    p = oi_stream.price()
+                    if p and p > 0:
+                        und_price = p
+                        break
+
+                if und_price is None and self._equity_stream is not None:
+                    und_price = self._equity_stream.price()
+
+                new_contracts = await qualify_chain_for_scan(
+                    self.ib,
+                    self._chain_specs,
+                    und_price,
+                    cfg.MONEYNESS_BAND,
+                    self.details_cache,
+                )
+
+                n_before = len(self.details_cache)
+                # details_cache already mutated in-place by qualify_chain_for_scan
+                n_after  = len(self.details_cache)
+                if n_after > n_before or not self._bg_qualify_done:
+                    save_qualified_cache(self.key, self.details_cache)
+
+                if not self._bg_qualify_done:
+                    print(f"[{self.key}] Background qualify complete: "
+                          f"{n_after} contracts in details_cache.")
+                    self._bg_qualify_done = True
+
+            except Exception as e:
+                print(f"[{self.key}][WARN] Background qualify error: {e}")
+
+            # Sleep one scan interval before re-checking for new in-band combos
+            await asyncio.sleep(cfg.SCAN_INTERVAL_SEC)
 
     # ── OI + momentum streams (FOP only) ─────────────────────────────────────
 
@@ -262,13 +340,29 @@ class InstrumentScanner:
             (v for v in underlying_price_map.values() if v and v > 0), None
         )
         if self._chain_specs:
-            contracts_to_quote = await qualify_chain_for_scan(
-                self.ib,
-                self._chain_specs,
-                und_price,
-                cfg.MONEYNESS_BAND,
-                self.details_cache,
-            )
+            if self.details_cache and self._bg_qualify_done:
+                # Background qualification has completed at least once.
+                # Use the already-qualified contracts from details_cache
+                # directly — no IB round-trip needed this scan cycle.
+                contracts_to_quote = [
+                    cd.contract for cd in self.details_cache.values()
+                    if hasattr(cd, 'contract')
+                ]
+            else:
+                # Either first startup before background task finishes, or
+                # details_cache is empty (no warm disk cache).  Fall through
+                # to the blocking qualify path — this happens at most once.
+                contracts_to_quote = await qualify_chain_for_scan(
+                    self.ib,
+                    self._chain_specs,
+                    und_price,
+                    cfg.MONEYNESS_BAND,
+                    self.details_cache,
+                )
+                # Save immediately so subsequent restarts skip this
+                if not self._bg_qualify_done and self.details_cache:
+                    save_qualified_cache(self.key, self.details_cache)
+                    self._bg_qualify_done = True
             if not self.underlying_contracts and self.cache_manager:
                 self.underlying_contracts = \
                     self.cache_manager.serve_underlying(self.key)
